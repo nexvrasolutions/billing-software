@@ -34,6 +34,9 @@ export interface IPurchaseItem {
 export interface IPurchase extends Document {
     tenantId: mongoose.Types.ObjectId;
 
+    // Used for offline-sync idempotency
+    operationId?: string;
+
     purchaseNo: string;
 
     supplierId: mongoose.Types.ObjectId;
@@ -176,6 +179,13 @@ const PurchaseSchema = new Schema<IPurchase>(
             ref: "Tenant",
             required: true,
             index: true,
+        },
+
+        // Used to identify the exact offline operation
+        // and prevent duplicate processing during retries.
+        operationId: {
+            type: String,
+            trim: true,
         },
 
         purchaseNo: {
@@ -343,6 +353,26 @@ PurchaseSchema.index(
     },
     {
         unique: true,
+    }
+);
+
+// Each offline operation can be processed only once
+// inside a tenant.
+//
+// Partial unique index allows normal online purchases
+// that do not have an operationId.
+PurchaseSchema.index(
+    {
+        tenantId: 1,
+        operationId: 1,
+    },
+    {
+        unique: true,
+        partialFilterExpression: {
+            operationId: {
+                $exists: true,
+            },
+        },
     }
 );
 

@@ -4,7 +4,7 @@ export interface IUnit extends Document {
     tenantId: mongoose.Types.ObjectId;
 
     name: string;
-    shortName?: string;
+    shortName: string;
 
     status: "active" | "inactive";
 
