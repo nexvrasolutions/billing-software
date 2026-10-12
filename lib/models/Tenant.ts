@@ -6,6 +6,11 @@ export interface ITenant extends Document {
 
     status: "active" | "inactive";
 
+    // The verified business owner. Only the owner may grant
+    // administrator-level roles. Set only by a server-side script
+    // (scripts/designate-tenant-owner.ts), never by an API request.
+    ownerUserId?: mongoose.Types.ObjectId;
+
     createdAt: Date;
     updatedAt: Date;
 }
@@ -27,6 +32,11 @@ const TenantSchema = new Schema<ITenant>(
             type: String,
             enum: ["active", "inactive"],
             default: "active",
+        },
+
+        ownerUserId: {
+            type: Schema.Types.ObjectId,
+            ref: "User",
         },
     },
     {

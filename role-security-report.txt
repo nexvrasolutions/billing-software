@@ -1,0 +1,84 @@
+﻿G:\Nexvra\billing-software\billing\app\api\auth\login\route.ts:115: roleId:
+G:\Nexvra\billing-software\billing\app\api\auth\login\route.ts:116: user.roleId?.toString(),
+G:\Nexvra\billing-software\billing\app\api\auth\login\route.ts:130: roleId:
+G:\Nexvra\billing-software\billing\app\api\auth\login\route.ts:131: user.roleId?.toString() ??
+G:\Nexvra\billing-software\billing\app\api\auth\me\route.ts:97: roleId:
+G:\Nexvra\billing-software\billing\app\api\auth\me\route.ts:98: user.roleId?.toString() ??
+G:\Nexvra\billing-software\billing\app\api\auth\session.ts:7: roleId?: string;
+G:\Nexvra\billing-software\billing\app\api\auth\session.ts:56: roleId:
+G:\Nexvra\billing-software\billing\app\api\auth\session.ts:57: typeof payload.roleId === "string"
+G:\Nexvra\billing-software\billing\app\api\auth\session.ts:58: ? payload.roleId
+G:\Nexvra\billing-software\billing\app\api\devices\[id]\route.ts:58: roleId: context.roleId,
+G:\Nexvra\billing-software\billing\app\api\devices\[id]\route.ts:109: roleId: context.roleId,
+G:\Nexvra\billing-software\billing\app\api\devices\route.ts:43: roleId: context.roleId,
+G:\Nexvra\billing-software\billing\app\api\devices\route.ts:83: roleId: context.roleId,
+G:\Nexvra\billing-software\billing\app\api\products\[id]\route.ts:50: roleId: auth.roleId,
+G:\Nexvra\billing-software\billing\app\api\products\[id]\route.ts:133: roleId: auth.roleId,
+G:\Nexvra\billing-software\billing\app\api\products\[id]\route.ts:385: roleId: auth.roleId,
+G:\Nexvra\billing-software\billing\app\api\products\route.ts:51: roleId: auth.roleId,
+G:\Nexvra\billing-software\billing\app\api\products\route.ts:109: roleId: auth.roleId,
+G:\Nexvra\billing-software\billing\app\api\users\[id]\route.ts:10: import { getAdministratorRoleIds } from "@/lib/auth/isAdministratorRole";
+G:\Nexvra\billing-software\billing\app\api\users\[id]\route.ts:21: roleId: z.string().regex(/^[a-f\d]{24}$/i).nullable().optional(),
+G:\Nexvra\billing-software\billing\app\api\users\[id]\route.ts:26: data.roleId !== undefined ||
+G:\Nexvra\billing-software\billing\app\api\users\[id]\route.ts:55: roleId: auth.roleId,
+G:\Nexvra\billing-software\billing\app\api\users\[id]\route.ts:73: .select("_id name email roleId status createdAt updatedAt")
+G:\Nexvra\billing-software\billing\app\api\users\[id]\route.ts:107: roleId: auth.roleId,
+G:\Nexvra\billing-software\billing\app\api\users\[id]\route.ts:147: if (input.roleId !== undefined && input.roleId !== null) {
+G:\Nexvra\billing-software\billing\app\api\users\[id]\route.ts:149: _id: new Types.ObjectId(input.roleId),
+G:\Nexvra\billing-software\billing\app\api\users\[id]\route.ts:168: roleId: Types.ObjectId | null;
+G:\Nexvra\billing-software\billing\app\api\users\[id]\route.ts:179: await TenantAdminGuard.findOneAndUpdate(
+G:\Nexvra\billing-software\billing\app\api\users\[id]\route.ts:208: const administratorRoleIds =
+G:\Nexvra\billing-software\billing\app\api\users\[id]\route.ts:209: await getAdministratorRoleIds(
+G:\Nexvra\billing-software\billing\app\api\users\[id]\route.ts:215: roleId: Types.ObjectId | undefined | null
+G:\Nexvra\billing-software\billing\app\api\users\[id]\route.ts:217: roleId != null &&
+G:\Nexvra\billing-software\billing\app\api\users\[id]\route.ts:218: administratorRoleIds.some(
+G:\Nexvra\billing-software\billing\app\api\users\[id]\route.ts:219: (adminRoleId) =>
+G:\Nexvra\billing-software\billing\app\api\users\[id]\route.ts:220: adminRoleId.toString() === roleId.toString()
+G:\Nexvra\billing-software\billing\app\api\users\[id]\route.ts:225: isAdministratorRole(user.roleId);
+G:\Nexvra\billing-software\billing\app\api\users\[id]\route.ts:229: const nextRoleId =
+G:\Nexvra\billing-software\billing\app\api\users\[id]\route.ts:230: input.roleId === undefined
+G:\Nexvra\billing-software\billing\app\api\users\[id]\route.ts:231: ? user.roleId
+G:\Nexvra\billing-software\billing\app\api\users\[id]\route.ts:232: : input.roleId === null
+G:\Nexvra\billing-software\billing\app\api\users\[id]\route.ts:234: : new Types.ObjectId(input.roleId);
+G:\Nexvra\billing-software\billing\app\api\users\[id]\route.ts:240: !isAdministratorRole(nextRoleId)
+G:\Nexvra\billing-software\billing\app\api\users\[id]\route.ts:248: roleId: { $in: administratorRoleIds },
+G:\Nexvra\billing-software\billing\app\api\users\[id]\route.ts:259: roleId: user.roleId?.toString() ?? null,
+G:\Nexvra\billing-software\billing\app\api\users\[id]\route.ts:267: if (input.roleId !== undefined) {
+G:\Nexvra\billing-software\billing\app\api\users\[id]\route.ts:268: user.roleId =
+G:\Nexvra\billing-software\billing\app\api\users\[id]\route.ts:269: input.roleId === null
+G:\Nexvra\billing-software\billing\app\api\users\[id]\route.ts:271: : new Types.ObjectId(input.roleId);
+G:\Nexvra\billing-software\billing\app\api\users\[id]\route.ts:294: roleId: user.roleId?.toString() ?? null,
+G:\Nexvra\billing-software\billing\app\api\users\[id]\route.ts:305: roleId: user.roleId ?? null,
+G:\Nexvra\billing-software\billing\app\api\users\route.ts:18: roleId: z.string().regex(/^[a-f\d]{24}$/i, "Invalid role ID"),
+G:\Nexvra\billing-software\billing\app\api\users\route.ts:25: roleId?: unknown;
+G:\Nexvra\billing-software\billing\app\api\users\route.ts:34: roleId: user.roleId ? String(user.roleId) : null,
+G:\Nexvra\billing-software\billing\app\api\users\route.ts:58: roleId: context.roleId,
+G:\Nexvra\billing-software\billing\app\api\users\route.ts:85: .select("_id name email roleId status createdAt updatedAt")
+G:\Nexvra\billing-software\billing\app\api\users\route.ts:99: roleId: user.roleId ? String(user.roleId) : null,
+G:\Nexvra\billing-software\billing\app\api\users\route.ts:138: roleId: context.roleId,
+G:\Nexvra\billing-software\billing\app\api\users\route.ts:176: const { name, email, password, roleId } = parsed.data;
+G:\Nexvra\billing-software\billing\app\api\users\route.ts:180: _id: roleId,
+G:\Nexvra\billing-software\billing\app\api\users\route.ts:222: roleId: role._id,
+G:\Nexvra\billing-software\billing\app\api\users\route.ts:243: roleId: String(role._id),
+G:\Nexvra\billing-software\billing\lib\auth\getAuthenticatedContext.ts:12: roleId?: string;
+G:\Nexvra\billing-software\billing\lib\auth\getAuthenticatedContext.ts:68: roleId:
+G:\Nexvra\billing-software\billing\lib\auth\getAuthenticatedContext.ts:69: user.roleId?.toString(),
+G:\Nexvra\billing-software\billing\lib\auth\hasPermission.ts:10: roleId?: string;
+G:\Nexvra\billing-software\billing\lib\auth\hasPermission.ts:17: roleId,
+G:\Nexvra\billing-software\billing\lib\auth\hasPermission.ts:22: !roleId ||
+G:\Nexvra\billing-software\billing\lib\auth\hasPermission.ts:25: !Types.ObjectId.isValid(roleId) ||
+G:\Nexvra\billing-software\billing\lib\auth\hasPermission.ts:34: const normalizedRoleId = new Types.ObjectId(roleId);
+G:\Nexvra\billing-software\billing\lib\auth\hasPermission.ts:44: .select("roleId")
+G:\Nexvra\billing-software\billing\lib\auth\hasPermission.ts:47: if (!user || !user.roleId) {
+G:\Nexvra\billing-software\billing\lib\auth\hasPermission.ts:53: user.roleId.toString() !== normalizedRoleId.toString()
+G:\Nexvra\billing-software\billing\lib\auth\hasPermission.ts:60: _id: normalizedRoleId,
+G:\Nexvra\billing-software\billing\lib\auth\isAdministratorRole.ts:13: export async function getAdministratorRoleIds(
+G:\Nexvra\billing-software\billing\lib\auth\isAdministratorRole.ts:45: permissions: { $all: permissionIds },
+G:\Nexvra\billing-software\billing\lib\models\Role.ts:9: permissions: mongoose.Types.ObjectId[];
+G:\Nexvra\billing-software\billing\lib\models\Role.ts:37: permissions: [
+G:\Nexvra\billing-software\billing\lib\models\User.ts:10: roleId?: mongoose.Types.ObjectId;
+G:\Nexvra\billing-software\billing\lib\models\User.ts:45: roleId: {
+G:\Nexvra\billing-software\billing\lib\services\StockService.ts:257: const updatedProduct = await Product.findOneAndUpdate(
+G:\Nexvra\billing-software\billing\lib\services\SyncService.ts:833: await SyncOperation.findOneAndUpdate(
+G:\Nexvra\billing-software\billing\lib\services\SyncService.ts:1011: await SyncOperation.findOneAndUpdate(
+G:\Nexvra\billing-software\billing\lib\services\SyncService.ts:1056: await SyncOperation.findOneAndUpdate(

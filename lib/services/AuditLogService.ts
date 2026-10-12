@@ -1,3 +1,4 @@
+
 import mongoose from "mongoose";
 import { AuditLog } from "@/lib/models/AuditLog";
 
@@ -11,9 +12,7 @@ export interface CreateAuditLogInput {
     action: string;
     entity: string;
     entityId?: mongoose.Types.ObjectId;
-
     description?: string;
-
     oldValues?: Record<string, unknown>;
     newValues?: Record<string, unknown>;
 }
@@ -22,9 +21,8 @@ export class AuditLogService {
     /**
      * Create an audit log.
      *
-     * This method can optionally receive a MongoDB session.
-     * When a session is provided, the audit log becomes part
-     * of the same transaction as the business operation.
+     * When a MongoDB session is provided, the audit log participates
+     * in the same transaction as the related business operation.
      */
     static async createAuditLog(
         user: AuditLogUserContext,
@@ -51,17 +49,22 @@ export class AuditLogService {
             tenantId: user.tenantId,
             userId: user.userId,
             deviceId: user.deviceId,
-
             action: input.action.trim(),
             entity: input.entity.trim(),
-
             entityId: input.entityId,
-
             description: input.description?.trim(),
-
             oldValues: input.oldValues,
             newValues: input.newValues,
         };
+
+        // TEMPORARY LOCAL TEST ONLY.
+        // Set this environment variable to "true" to simulate audit failure.
+        if (
+            process.env.TEST_AUDIT_LOG_FAILURE === "true" &&
+            process.env.NODE_ENV !== "production"
+        ) {
+            throw new Error("TEST_ONLY_AUDIT_FAILURE");
+        }
 
         const [auditLog] = await AuditLog.create(
             [auditLogData],
@@ -74,3 +77,4 @@ export class AuditLogService {
         return auditLog;
     }
 }
+

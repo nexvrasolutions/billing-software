@@ -1,26 +1,27 @@
-import { NextResponse } from "next/server";
+import { NextRequest, NextResponse } from "next/server";
 import mongoose from "mongoose";
 
-import { connectDB } from "@/lib/db/mongodb";
 import { Tax } from "@/lib/models/Tax";
+import { getAuthenticatedContext } from "@/lib/auth/getAuthenticatedContext";
 
 export async function DELETE(
-    request: Request,
+    request: NextRequest,
     { params }: { params: Promise<{ id: string }> }
 ) {
     try {
-        await connectDB();
+        const context =
+            await getAuthenticatedContext(request);
 
-        // Temporary test user and tenant
-        // We will replace these with real authentication later.
-        const user = {
-            userId: new mongoose.Types.ObjectId(
-                "6abe4d3f6ae4b08a3e335463"
-            ),
-            tenantId: new mongoose.Types.ObjectId(
-                "6abe48a86ae4b08a3e335303"
-            ),
-        };
+        if (!context) {
+            return NextResponse.json(
+                {
+                    success: false,
+                    message:
+                        "Not authenticated or invalid authentication context",
+                },
+                { status: 401 }
+            );
+        }
 
         const { id } = await params;
 
@@ -35,10 +36,10 @@ export async function DELETE(
             );
         }
 
-        // Find tax belonging to this tenant
+        // Find tax belonging only to the authenticated tenant
         const tax = await Tax.findOne({
             _id: id,
-            tenantId: user.tenantId,
+            tenantId: context.tenantId,
         });
 
         if (!tax) {
@@ -76,7 +77,10 @@ export async function DELETE(
             { status: 200 }
         );
     } catch (error) {
-        console.error("Delete tax error:", error);
+        console.error(
+            "Delete tax error:",
+            error
+        );
 
         return NextResponse.json(
             {

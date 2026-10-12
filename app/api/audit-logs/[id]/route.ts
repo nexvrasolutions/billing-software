@@ -1,10 +1,16 @@
-import { NextResponse } from "next/server";
+import { NextRequest, NextResponse } from "next/server";
 import mongoose from "mongoose";
 
 import { connectDB } from "@/lib/db/mongodb";
 import { AuditLog } from "@/lib/models/AuditLog";
-
-const TEST_TENANT_ID = "6abe48a86ae4b08a3e335303";
+import { getAuthenticatedContext } from "@/lib/auth/getAuthenticatedContext";
+import { hasPermission } from "@/lib/auth/hasPermission";
+import {
+    AUDIT_LOG_PUBLIC_FIELDS,
+    AUDIT_LOG_READ_PERMISSION,
+    publicAuditLog,
+} from "@/lib/auditLogs/auditLogApi";
+import { errorResponse } from "@/lib/users/userApi";
 
 type RouteContext = {
     params: Promise<{
@@ -13,55 +19,60 @@ type RouteContext = {
 };
 
 export async function GET(
-    request: Request,
+    request: NextRequest,
     context: RouteContext
 ) {
     try {
+        const authContext =
+            await getAuthenticatedContext(request);
+
+        if (!authContext) {
+            return errorResponse("Authentication required", 401);
+        }
+
         await connectDB();
+
+        const allowed = await hasPermission({
+            userId: authContext.userId,
+            tenantId: authContext.tenantId,
+            roleId: authContext.roleId,
+            permission: AUDIT_LOG_READ_PERMISSION,
+        });
+
+        if (!allowed) {
+            return errorResponse("Permission denied", 403);
+        }
 
         const { id } = await context.params;
 
         // Validate audit log ID
-        if (!mongoose.Types.ObjectId.isValid(id)) {
-            return NextResponse.json(
-                {
-                    success: false,
-                    message: "Invalid audit log ID",
-                },
-                { status: 400 }
-            );
+        if (!/^[a-f\d]{24}$/i.test(id)) {
+            return errorResponse("Invalid audit log ID", 400);
         }
 
         const auditLog = await AuditLog.findOne({
             _id: new mongoose.Types.ObjectId(id),
 
-            // Important: tenant isolation
-            tenantId: new mongoose.Types.ObjectId(TEST_TENANT_ID),
-        }).lean();
+            // Tenant isolation:
+            // only allow the authenticated user's tenant
+            tenantId: new mongoose.Types.ObjectId(
+                authContext.tenantId
+            ),
+        })
+            .select(AUDIT_LOG_PUBLIC_FIELDS)
+            .lean();
 
         if (!auditLog) {
-            return NextResponse.json(
-                {
-                    success: false,
-                    message: "Audit log not found",
-                },
-                { status: 404 }
-            );
+            return errorResponse("Audit log not found", 404);
         }
 
         return NextResponse.json({
             success: true,
-            auditLog,
+            auditLog: publicAuditLog(auditLog),
         });
     } catch (error) {
         console.error("Audit log fetch error:", error);
 
-        return NextResponse.json(
-            {
-                success: false,
-                message: "Failed to fetch audit log",
-            },
-            { status: 500 }
-        );
+        return errorResponse("Failed to fetch audit log", 500);
     }
 }

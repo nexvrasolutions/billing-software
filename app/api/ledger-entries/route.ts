@@ -1,22 +1,51 @@
-import { NextResponse } from "next/server";
+import { NextRequest, NextResponse } from "next/server";
 import mongoose from "mongoose";
 
 import { connectDB } from "@/lib/db/mongodb";
 import { LedgerService } from "@/lib/services/LedgerService";
+import { getAuthenticatedContext } from "@/lib/auth/getAuthenticatedContext";
 
-export async function POST(request: Request) {
+export async function POST(request: NextRequest) {
     try {
+        const authContext =
+            await getAuthenticatedContext(request);
+
+        if (!authContext) {
+            return NextResponse.json(
+                {
+                    success: false,
+                    message:
+                        "Not authenticated or invalid authentication context",
+                },
+                { status: 401 }
+            );
+        }
+
         await connectDB();
 
         const body = await request.json();
 
-        // TEMPORARY TEST USER
+        if (
+            !body.entries ||
+            !Array.isArray(body.entries) ||
+            body.entries.length === 0
+        ) {
+            return NextResponse.json(
+                {
+                    success: false,
+                    message:
+                        "entries array is required",
+                },
+                { status: 400 }
+            );
+        }
+
         const user = {
             userId: new mongoose.Types.ObjectId(
-                "6abe4d3f6ae4b08a3e335463"
+                authContext.userId
             ),
             tenantId: new mongoose.Types.ObjectId(
-                "6abe48a86ae4b08a3e335303"
+                authContext.tenantId
             ),
         };
 

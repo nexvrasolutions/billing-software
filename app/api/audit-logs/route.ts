@@ -1,132 +1,103 @@
-import { NextResponse } from "next/server";
+import { NextRequest, NextResponse } from "next/server";
 import mongoose from "mongoose";
 
 import { connectDB } from "@/lib/db/mongodb";
 import { AuditLog } from "@/lib/models/AuditLog";
+import { getAuthenticatedContext } from "@/lib/auth/getAuthenticatedContext";
+import { hasPermission } from "@/lib/auth/hasPermission";
+import {
+    AUDIT_LOG_PUBLIC_FIELDS,
+    AUDIT_LOG_READ_PERMISSION,
+    listAuditLogsQuerySchema,
+    publicAuditLog,
+} from "@/lib/auditLogs/auditLogApi";
+import {
+    errorResponse,
+    validationErrorResponse,
+} from "@/lib/users/userApi";
 
-const TEST_TENANT_ID = "6abe48a86ae4b08a3e335303";
-const TEST_USER_ID = "6abe4d3f6ae4b08a3e335463";
+/*
+ * Audit logs are written ONLY by trusted server-side code through
+ * AuditLogService (inside the same transaction as the change they record).
+ * There is deliberately no POST handler: clients must never be able to
+ * create audit records, choose the actor/device, or fabricate events such
+ * as "user.admin_granted". Next.js answers other methods with 405.
+ */
 
-export async function POST(request: Request) {
+// GET /api/audit-logs?page=1&limit=50&action=user.created&entity=User&entityId=...
+export async function GET(
+    request: NextRequest
+) {
     try {
+        const context =
+            await getAuthenticatedContext(request);
+
+        if (!context) {
+            return errorResponse("Authentication required", 401);
+        }
+
         await connectDB();
 
-        const body = await request.json();
-
-        const {
-            action,
-            entity,
-            entityId,
-            description,
-            oldValues,
-            newValues,
-            deviceId,
-        } = body;
-
-        if (!action || !entity) {
-            return NextResponse.json(
-                {
-                    success: false,
-                    message: "action and entity are required",
-                },
-                { status: 400 }
-            );
-        }
-
-        if (
-            entityId !== undefined &&
-            !mongoose.Types.ObjectId.isValid(entityId)
-        ) {
-            return NextResponse.json(
-                {
-                    success: false,
-                    message: "Invalid entityId",
-                },
-                { status: 400 }
-            );
-        }
-
-        if (
-            deviceId !== undefined &&
-            !mongoose.Types.ObjectId.isValid(deviceId)
-        ) {
-            return NextResponse.json(
-                {
-                    success: false,
-                    message: "Invalid deviceId",
-                },
-                { status: 400 }
-            );
-        }
-
-        const auditLog = await AuditLog.create({
-            tenantId: new mongoose.Types.ObjectId(TEST_TENANT_ID),
-
-            userId: new mongoose.Types.ObjectId(TEST_USER_ID),
-
-            deviceId: deviceId
-                ? new mongoose.Types.ObjectId(deviceId)
-                : undefined,
-
-            action: action.trim(),
-            entity: entity.trim(),
-
-            entityId: entityId
-                ? new mongoose.Types.ObjectId(entityId)
-                : undefined,
-
-            description: description?.trim(),
-
-            oldValues,
-            newValues,
+        const allowed = await hasPermission({
+            userId: context.userId,
+            tenantId: context.tenantId,
+            roleId: context.roleId,
+            permission: AUDIT_LOG_READ_PERMISSION,
         });
 
-        return NextResponse.json(
-            {
-                success: true,
-                message: "Audit log created successfully",
-                auditLog,
-            },
-            { status: 201 }
+        if (!allowed) {
+            return errorResponse("Permission denied", 403);
+        }
+
+        const parsedQuery = listAuditLogsQuerySchema.safeParse(
+            Object.fromEntries(request.nextUrl.searchParams)
         );
-    } catch (error) {
-        console.error("Audit log creation error:", error);
 
-        return NextResponse.json(
-            {
-                success: false,
-                message: "Failed to create audit log",
-            },
-            { status: 500 }
-        );
-    }
-}
+        if (!parsedQuery.success) {
+            return validationErrorResponse(
+                "Invalid query parameters",
+                parsedQuery.error
+            );
+        }
 
-export async function GET() {
-    try {
-        await connectDB();
+        const { page, limit, action, entity, entityId } =
+            parsedQuery.data;
 
-        const auditLogs = await AuditLog.find({
-            tenantId: new mongoose.Types.ObjectId(TEST_TENANT_ID),
-        })
-            .sort({ createdAt: -1 })
-            .limit(100)
-            .lean();
+        // Tenant isolation: tenantId always comes from the verified session.
+        const filter: Record<string, unknown> = {
+            tenantId: new mongoose.Types.ObjectId(context.tenantId),
+        };
+
+        if (action) filter.action = action;
+        if (entity) filter.entity = entity;
+        if (entityId) filter.entityId = new mongoose.Types.ObjectId(entityId);
+
+        const [auditLogs, total] = await Promise.all([
+            AuditLog.find(filter)
+                .select(AUDIT_LOG_PUBLIC_FIELDS)
+                .sort({ createdAt: -1 })
+                .skip((page - 1) * limit)
+                .limit(limit)
+                .lean(),
+            AuditLog.countDocuments(filter),
+        ]);
 
         return NextResponse.json({
             success: true,
-            count: auditLogs.length,
-            auditLogs,
+            auditLogs: auditLogs.map(publicAuditLog),
+            pagination: {
+                page,
+                limit,
+                total,
+                totalPages: Math.ceil(total / limit),
+            },
         });
     } catch (error) {
-        console.error("Audit log fetch error:", error);
-
-        return NextResponse.json(
-            {
-                success: false,
-                message: "Failed to fetch audit logs",
-            },
-            { status: 500 }
+        console.error(
+            "Audit log fetch error:",
+            error
         );
+
+        return errorResponse("Failed to fetch audit logs", 500);
     }
 }

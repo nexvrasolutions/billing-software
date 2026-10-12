@@ -1,0 +1,71 @@
+﻿G:\Nexvra\billing-software\billing\app\api\users\[id]\route.ts:108: permission: "users.update",
+G:\Nexvra\billing-software\billing\app\api\users\route.ts:139: permission: "users.create",
+G:\Nexvra\billing-software\billing\lib\auth\hasPermission.ts:64: .select("permissions")
+G:\Nexvra\billing-software\billing\lib\auth\hasPermission.ts:67: if (!role || !role.permissions?.length) {
+G:\Nexvra\billing-software\billing\lib\auth\hasPermission.ts:84: return role.permissions.some(
+G:\Nexvra\billing-software\billing\lib\auth\isAdministratorRole.ts:7: const ADMIN_PERMISSIONS = [
+G:\Nexvra\billing-software\billing\lib\auth\isAdministratorRole.ts:8: "users.create",
+G:\Nexvra\billing-software\billing\lib\auth\isAdministratorRole.ts:9: "users.update",
+G:\Nexvra\billing-software\billing\lib\auth\isAdministratorRole.ts:10: "users.delete",
+G:\Nexvra\billing-software\billing\lib\auth\isAdministratorRole.ts:18: name: { $in: [...ADMIN_PERMISSIONS] },
+G:\Nexvra\billing-software\billing\lib\auth\isAdministratorRole.ts:25: const permissions = await permissionQuery.lean();
+G:\Nexvra\billing-software\billing\lib\auth\isAdministratorRole.ts:28: const permissionIds = ADMIN_PERMISSIONS.map((name) => {
+G:\Nexvra\billing-software\billing\lib\auth\isAdministratorRole.ts:29: const permission = permissions.find(
+G:\Nexvra\billing-software\billing\lib\auth\isAdministratorRole.ts:45: permissions: { $all: permissionIds },
+G:\Nexvra\billing-software\billing\lib\models\Permission.ts:11: const PermissionSchema = new Schema<IPermission>(
+G:\Nexvra\billing-software\billing\lib\models\Permission.ts:32: mongoose.model<IPermission>("Permission", PermissionSchema);
+G:\Nexvra\billing-software\billing\lib\models\Role.ts:9: permissions: mongoose.Types.ObjectId[];
+G:\Nexvra\billing-software\billing\lib\models\Role.ts:37: permissions: [
+G:\Nexvra\billing-software\billing\public\sw.js:10: * See the License for the specific language governing permissions and
+G:\Nexvra\billing-software\billing\scripts\assign-product-delete-permission.ts:35: const alreadyAssigned = role.permissions.some(
+G:\Nexvra\billing-software\billing\scripts\assign-product-delete-permission.ts:40: role.permissions.push(permission._id);
+G:\Nexvra\billing-software\billing\scripts\assign-product-delete-permission.ts:45: .populate("permissions", "name description")
+G:\Nexvra\billing-software\billing\scripts\assign-product-read-permission.ts:42: const alreadyAssigned = role.permissions.some(
+G:\Nexvra\billing-software\billing\scripts\assign-product-read-permission.ts:47: role.permissions.push(permissionId);
+G:\Nexvra\billing-software\billing\scripts\assign-product-update-permission.ts:50: const alreadyAssigned = role.permissions.some(
+G:\Nexvra\billing-software\billing\scripts\assign-product-update-permission.ts:55: role.permissions.push(permissionId);
+G:\Nexvra\billing-software\billing\scripts\assign-product-update-permission.ts:62: "Permissions:",
+G:\Nexvra\billing-software\billing\scripts\assign-product-update-permission.ts:64: _id: { $in: role.permissions },
+G:\Nexvra\billing-software\billing\scripts\create-permission-test-user.ts:39: // Verify that the role is active and has no permissions.
+G:\Nexvra\billing-software\billing\scripts\create-permission-test-user.ts:46: if (!role || role.permissions.length !== 0) {
+G:\Nexvra\billing-software\billing\scripts\create-permission-test-user.ts:48: "The test role is missing, inactive, or has permissions."
+G:\Nexvra\billing-software\billing\scripts\enable-tenant-b-product-create.ts:34: const alreadyAssigned = role.permissions.some(
+G:\Nexvra\billing-software\billing\scripts\enable-tenant-b-product-create.ts:39: role.permissions.push(permission._id);
+G:\Nexvra\billing-software\billing\scripts\grant-test-product-delete.ts:37: const alreadyHasPermission = role.permissions.some(
+G:\Nexvra\billing-software\billing\scripts\grant-test-product-delete.ts:42: role.permissions.push(permission._id);
+G:\Nexvra\billing-software\billing\scripts\grant-test-product-update.ts:45: const alreadyHasPermission = role.permissions.some(
+G:\Nexvra\billing-software\billing\scripts\grant-test-product-update.ts:54: role.permissions.push(permission._id);
+G:\Nexvra\billing-software\billing\scripts\grant-test-product-update.ts:60: console.log("Existing permissions were preserved.");
+G:\Nexvra\billing-software\billing\scripts\remove-test-product-permissions.ts:28: const permissions = await Permission.find({
+G:\Nexvra\billing-software\billing\scripts\remove-test-product-permissions.ts:33: permissions.map((permission) => permission._id.toString())
+G:\Nexvra\billing-software\billing\scripts\remove-test-product-permissions.ts:36: role.permissions = role.permissions.filter(
+G:\Nexvra\billing-software\billing\scripts\remove-test-product-permissions.ts:42: console.log("Temporary test permissions removed.");
+G:\Nexvra\billing-software\billing\scripts\remove-test-product-permissions.ts:43: console.log("Other role permissions were preserved.");
+G:\Nexvra\billing-software\billing\scripts\remove-test-product-permissions.ts:50: console.error("Failed to remove test permissions:", error);
+G:\Nexvra\billing-software\billing\scripts\setup-admin-protection-test.ts:41: Permission.findOne({ name: "users.update" }),
+G:\Nexvra\billing-software\billing\scripts\setup-admin-protection-test.ts:46: "Admin, test user, or users.update permission was not found. No role changes were made."
+G:\Nexvra\billing-software\billing\scripts\setup-admin-protection-test.ts:61: _id: { $in: adminRole.permissions },
+G:\Nexvra\billing-software\billing\scripts\setup-admin-protection-test.ts:64: const requiredAdminPermissions = [
+G:\Nexvra\billing-software\billing\scripts\setup-admin-protection-test.ts:65: "users.create",
+G:\Nexvra\billing-software\billing\scripts\setup-admin-protection-test.ts:66: "users.update",
+G:\Nexvra\billing-software\billing\scripts\setup-admin-protection-test.ts:67: "users.delete",
+G:\Nexvra\billing-software\billing\scripts\setup-admin-protection-test.ts:71: !requiredAdminPermissions.every((name) =>
+G:\Nexvra\billing-software\billing\scripts\setup-admin-protection-test.ts:76: "Original Admin role does not have all expected permissions. Stopping."
+G:\Nexvra\billing-software\billing\scripts\setup-admin-protection-test.ts:84: testRole = await Role.create({
+G:\Nexvra\billing-software\billing\scripts\setup-admin-protection-test.ts:89: permissions: [updatePermission._id],
+G:\Nexvra\billing-software\billing\scripts\setup-admin-protection-test.ts:94: _id: { $in: testRole.permissions },
+G:\Nexvra\billing-software\billing\scripts\setup-admin-protection-test.ts:99: existingPermissionNames[0] !== "users.update"
+G:\Nexvra\billing-software\billing\scripts\setup-admin-protection-test.ts:102: "The existing test role has unexpected permissions. It was not changed."
+G:\Nexvra\billing-software\billing\scripts\setup-admin-protection-test.ts:115: console.log("Test role permissions: users.update only");
+G:\Nexvra\billing-software\billing\scripts\setup-tenant-b-role.ts:9: const REQUIRED_PERMISSIONS = [
+G:\Nexvra\billing-software\billing\scripts\setup-tenant-b-role.ts:11: "users.create",
+G:\Nexvra\billing-software\billing\scripts\setup-tenant-b-role.ts:20: const permissions = await Permission.find({
+G:\Nexvra\billing-software\billing\scripts\setup-tenant-b-role.ts:21: name: { $in: REQUIRED_PERMISSIONS },
+G:\Nexvra\billing-software\billing\scripts\setup-tenant-b-role.ts:24: const foundNames = new Set(permissions.map((p) => p.name));
+G:\Nexvra\billing-software\billing\scripts\setup-tenant-b-role.ts:25: const missing = REQUIRED_PERMISSIONS.filter(
+G:\Nexvra\billing-software\billing\scripts\setup-tenant-b-role.ts:31: `Missing permissions: ${missing.join(", ")}`
+G:\Nexvra\billing-software\billing\scripts\setup-tenant-b-role.ts:45: permissions: permissions.map((p) => p._id),
+G:\Nexvra\billing-software\billing\scripts\setup-tenant-b-role.ts:61: permissions: REQUIRED_PERMISSIONS,
+G:\Nexvra\billing-software\billing\scripts\test-permission-security.ts:24: throw new Error("No permission exists. Seed permissions first.");
+G:\Nexvra\billing-software\billing\scripts\test-permission-security.ts:44: const roleA = await Role.create({
+G:\Nexvra\billing-software\billing\scripts\test-permission-security.ts:47: permissions: [permission._id],

@@ -11,6 +11,11 @@ export interface IUser extends Document {
 
     status: "active" | "inactive";
 
+    // Set when an administrator resets the password. Until the user picks
+    // a new password, only the password-change endpoints accept the session.
+    // Missing/false means unrestricted. Never settable through user APIs.
+    mustChangePassword?: boolean;
+
     createdAt: Date;
     updatedAt: Date;
 }
@@ -51,6 +56,11 @@ const UserSchema = new Schema<IUser>(
             type: String,
             enum: ["active", "inactive"],
             default: "active",
+        },
+
+        mustChangePassword: {
+            type: Boolean,
+            default: false,
         },
     },
     {

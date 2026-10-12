@@ -7,6 +7,14 @@ import mongoose, {
 export interface IPayment extends Document {
     tenantId: mongoose.Types.ObjectId;
 
+    /*
+     * Idempotency key for offline/sync operations.
+     *
+     * One operationId can create only one payment
+     * within a tenant.
+     */
+    operationId?: string;
+
     paymentNo: string;
 
     type:
@@ -57,6 +65,16 @@ const PaymentSchema = new Schema<IPayment>(
             ref: "Tenant",
             required: true,
             index: true,
+        },
+
+        /*
+         * Idempotency key.
+         *
+         * Used mainly for offline/sync operations.
+         */
+        operationId: {
+            type: String,
+            trim: true,
         },
 
         paymentNo: {
@@ -177,6 +195,31 @@ const PaymentSchema = new Schema<IPayment>(
 PaymentSchema.index(
     { tenantId: 1, paymentNo: 1 },
     { unique: true }
+);
+
+/*
+ * Idempotency protection.
+ *
+ * If operationId exists:
+ *
+ * tenant A + OP-001 → allowed
+ * tenant A + OP-001 → duplicate
+ *
+ * tenant B + OP-001 → allowed
+ *
+ * This allows the same operationId to exist
+ * in different tenants.
+ */
+PaymentSchema.index(
+    { tenantId: 1, operationId: 1 },
+    {
+        unique: true,
+        partialFilterExpression: {
+            operationId: {
+                $exists: true,
+            },
+        },
+    }
 );
 
 /*

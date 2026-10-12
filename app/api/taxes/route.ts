@@ -1,25 +1,29 @@
-import { NextResponse } from "next/server";
-import mongoose from "mongoose";
+import { NextRequest, NextResponse } from "next/server";
 
-import { connectDB } from "@/lib/db/mongodb";
-import { Tax } from "@/lib/models/Tax"; export async function GET() {
+import { Tax } from "@/lib/models/Tax";
+import { getAuthenticatedContext } from "@/lib/auth/getAuthenticatedContext";
+
+export async function GET(
+    request: NextRequest
+) {
     try {
-        await connectDB();
+        const context =
+            await getAuthenticatedContext(request);
 
-        // Temporary test user and tenant
-        // We will replace these with real authentication later.
-        const user = {
-            userId: new mongoose.Types.ObjectId(
-                "6abe4d3f6ae4b08a3e335463"
-            ),
-            tenantId: new mongoose.Types.ObjectId(
-                "6abe48a86ae4b08a3e335303"
-            ),
-        };
+        if (!context) {
+            return NextResponse.json(
+                {
+                    success: false,
+                    message:
+                        "Not authenticated or invalid authentication context",
+                },
+                { status: 401 }
+            );
+        }
 
-        // Get taxes belonging only to this tenant
+        // Get taxes belonging only to the authenticated tenant
         const taxes = await Tax.find({
-            tenantId: user.tenantId,
+            tenantId: context.tenantId,
         })
             .sort({ createdAt: -1 })
             .lean();
@@ -33,7 +37,10 @@ import { Tax } from "@/lib/models/Tax"; export async function GET() {
             { status: 200 }
         );
     } catch (error) {
-        console.error("Get taxes error:", error);
+        console.error(
+            "Get taxes error:",
+            error
+        );
 
         return NextResponse.json(
             {

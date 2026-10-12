@@ -26,14 +26,27 @@ export interface ISyncOperation extends Document {
 
     payload: Record<string, unknown>;
 
+    // User whose session uploaded the operation. Missing on legacy records.
+    userId?: mongoose.Types.ObjectId;
+
     status:
     | "PENDING"
     | "PROCESSING"
     | "SYNCED"
     | "FAILED"
+    | "NEEDS_ATTENTION"
     | "CANCELLED";
 
     attempts: number;
+
+    // Processing lease: only the holder of leaseToken may finish the
+    // operation; an expired lease can be reclaimed after a crash.
+    leaseToken?: string;
+    leaseExpiresAt?: Date;
+
+    // Why the last attempt failed: RETRYABLE (temporary), PERMANENT
+    // (business/data error) or RETRIES_EXHAUSTED.
+    failureKind?: "RETRYABLE" | "PERMANENT" | "RETRIES_EXHAUSTED";
 
     lastAttemptAt?: Date;
 
@@ -109,16 +122,35 @@ const SyncOperationSchema = new Schema<ISyncOperation>(
                 "PROCESSING",
                 "SYNCED",
                 "FAILED",
+                "NEEDS_ATTENTION",
                 "CANCELLED",
             ],
             default: "PENDING",
             required: true,
         },
 
+        userId: {
+            type: Schema.Types.ObjectId,
+            ref: "User",
+        },
+
         attempts: {
             type: Number,
             default: 0,
             min: 0,
+        },
+
+        leaseToken: {
+            type: String,
+        },
+
+        leaseExpiresAt: {
+            type: Date,
+        },
+
+        failureKind: {
+            type: String,
+            enum: ["RETRYABLE", "PERMANENT", "RETRIES_EXHAUSTED"],
         },
 
         lastAttemptAt: {

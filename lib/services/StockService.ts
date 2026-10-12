@@ -1,3 +1,4 @@
+
 import mongoose from "mongoose";
 
 import { Product } from "@/lib/models/Product";
@@ -13,8 +14,8 @@ export interface StockChangeInput {
     productId: string;
 
     /**
-     * Positive quantity = stock increase
-     * Negative quantity = stock decrease
+     * Positive quantity = stock increase.
+     * Negative quantity = stock decrease.
      */
     quantity: number;
 
@@ -31,40 +32,120 @@ export interface StockChangeInput {
     };
 
     referenceId?: string;
-
     reason?: string;
 }
 
 export class StockService {
     /**
-     * Change product stock and create a stock movement.
+     * Changes stock.
      *
-     * Examples:
-     *
-     * Purchase:
-     * quantity: 20
-     *
-     * Sale:
-     * quantity: -5
-     *
-     * Sales return:
-     * quantity: 5
-     *
-     * Purchase return:
-     * quantity: -3
-     *
-     * Adjustment:
-     * quantity: 10 or -10
+     * If a caller supplies a session, its existing transaction
+     * is reused. Otherwise, this method creates and owns a
+     * MongoDB transaction.
      */
     static async changeStock(
         user: StockUserContext,
         input: StockChangeInput,
-        session?: mongoose.ClientSession
+        session?: mongoose.ClientSession,
+        operationId?: string
     ) {
-        // --------------------------------------------------
-        // 1. Validate user
-        // --------------------------------------------------
+        const normalizedOperationId =
+            operationId?.trim() || undefined;
 
+        // Reuse the transaction owned by SalesService,
+        // PurchaseService, or another calling service.
+        if (session) {
+            return this.changeStockInSession(
+                user,
+                input,
+                session,
+                normalizedOperationId
+            );
+        }
+
+        // Standalone calls get their own transaction.
+        const ownSession = await mongoose.startSession();
+
+        try {
+            let result:
+                | Awaited<
+                    ReturnType<
+                        typeof StockService.changeStockInSession
+                    >
+                >
+                | undefined;
+
+            await ownSession.withTransaction(async () => {
+                result = await this.changeStockInSession(
+                    user,
+                    input,
+                    ownSession,
+                    normalizedOperationId
+                );
+            });
+
+            if (!result) {
+                throw new Error(
+                    "Stock transaction completed without a result"
+                );
+            }
+
+            return result;
+        } catch (error: unknown) {
+            // A concurrent request may have completed the
+            // same adjustment first. Look up the movement
+            // only after the transaction has failed.
+            const mongoError = error as { code?: number };
+
+            if (
+                mongoError?.code === 11000 &&
+                input.type === "adjustment" &&
+                normalizedOperationId
+            ) {
+                const existingMovement =
+                    await StockMovement.findOne({
+                        tenantId: user.tenantId,
+                        operationId: normalizedOperationId,
+                        type: "adjustment",
+                    });
+
+                if (existingMovement) {
+                    const product = await Product.findOne({
+                        _id: existingMovement.productId,
+                        tenantId: user.tenantId,
+                    });
+
+                    return {
+                        product,
+                        movement: existingMovement,
+                        previousStock:
+                            existingMovement.previousStock,
+                        newStock: existingMovement.newStock,
+                        quantityChanged:
+                            existingMovement.quantity,
+                        auditLog: undefined,
+                        alreadyProcessed: true,
+                    };
+                }
+            }
+
+            throw error;
+        } finally {
+            await ownSession.endSession();
+        }
+    }
+
+    /**
+     * Performs the stock update, movement creation, and
+     * audit logging inside the supplied transaction.
+     */
+    private static async changeStockInSession(
+        user: StockUserContext,
+        input: StockChangeInput,
+        session: mongoose.ClientSession,
+        operationId?: string
+    ) {
+        // 1. Validate authenticated context.
         if (!user.userId) {
             throw new Error("Authenticated user is required");
         }
@@ -73,18 +154,12 @@ export class StockService {
             throw new Error("Tenant context is required");
         }
 
-        // --------------------------------------------------
-        // 2. Validate product ID
-        // --------------------------------------------------
-
+        // 2. Validate product ID.
         if (!mongoose.isValidObjectId(input.productId)) {
             throw new Error("Invalid product ID");
         }
 
-        // --------------------------------------------------
-        // 3. Validate quantity
-        // --------------------------------------------------
-
+        // 3. Validate quantity.
         if (
             typeof input.quantity !== "number" ||
             !Number.isFinite(input.quantity) ||
@@ -95,18 +170,29 @@ export class StockService {
             );
         }
 
-        // --------------------------------------------------
-        // 4. Validate warehouse
-        // --------------------------------------------------
+        // 4. Validate movement type.
+        const validTypes = [
+            "purchase",
+            "sale",
+            "purchase_return",
+            "sales_return",
+            "adjustment",
+        ] as const;
 
+        if (
+            !validTypes.includes(
+                input.type as (typeof validTypes)[number]
+            )
+        ) {
+            throw new Error("Invalid stock movement type");
+        }
+
+        // 5. Validate warehouse.
         if (!input.warehouse?.name?.trim()) {
             throw new Error("Warehouse name is required");
         }
 
-        // --------------------------------------------------
-        // 5. Validate reference ID
-        // --------------------------------------------------
-
+        // 6. Validate reference ID.
         if (
             input.referenceId &&
             !mongoose.isValidObjectId(input.referenceId)
@@ -114,44 +200,50 @@ export class StockService {
             throw new Error("Invalid reference ID");
         }
 
-        // --------------------------------------------------
-        // 6. Find product
-        // --------------------------------------------------
+        // 7. Idempotency check for adjustments.
+        // A retry of the same operation must not change stock again.
+        if (input.type === "adjustment" && operationId) {
+            const existingMovement =
+                await StockMovement.findOne({
+                    tenantId: user.tenantId,
+                    operationId,
+                    type: "adjustment",
+                }).session(session);
 
-        const productQuery = Product.findOne({
+            if (existingMovement) {
+                const existingProduct = await Product.findOne({
+                    _id: existingMovement.productId,
+                    tenantId: user.tenantId,
+                }).session(session);
+
+                return {
+                    product: existingProduct,
+                    movement: existingMovement,
+                    previousStock:
+                        existingMovement.previousStock,
+                    newStock: existingMovement.newStock,
+                    quantityChanged:
+                        existingMovement.quantity,
+                    auditLog: undefined,
+                    alreadyProcessed: true,
+                };
+            }
+        }
+
+        // 8. Find the active product in this tenant only.
+        const product = await Product.findOne({
             _id: input.productId,
             tenantId: user.tenantId,
             status: "active",
-        });
-
-        if (session) {
-            productQuery.session(session);
-        }
-
-        const product = await productQuery;
+        }).session(session);
 
         if (!product) {
-            throw new Error(
-                "Product not found or inactive"
-            );
+            throw new Error("Product not found or inactive");
         }
 
-        // --------------------------------------------------
-        // 7. Get previous stock
-        // --------------------------------------------------
-
+        // 9. Calculate stock change.
         const previousStock = product.stockQuantity;
-
-        // --------------------------------------------------
-        // 8. Calculate new stock
-        // --------------------------------------------------
-
-        const newStock =
-            previousStock + input.quantity;
-
-        // --------------------------------------------------
-        // 9. Prevent negative stock
-        // --------------------------------------------------
+        const newStock = previousStock + input.quantity;
 
         if (newStock < 0) {
             throw new Error(
@@ -159,23 +251,18 @@ export class StockService {
             );
         }
 
-        // --------------------------------------------------
-        // 10. Update product stock
-        // --------------------------------------------------
-
-        const updateQuery = Product.findOneAndUpdate(
+        // 10. Atomically update stock.
+        // The stockQuantity condition prevents concurrent
+        // decrements from taking stock below zero.
+        const updatedProduct = await Product.findOneAndUpdate(
             {
                 _id: product._id,
                 tenantId: user.tenantId,
                 status: "active",
-
-                // Extra protection when decreasing stock
                 ...(input.quantity < 0
                     ? {
                         stockQuantity: {
-                            $gte: Math.abs(
-                                input.quantity
-                            ),
+                            $gte: Math.abs(input.quantity),
                         },
                     }
                     : {}),
@@ -187,80 +274,49 @@ export class StockService {
             },
             {
                 new: true,
+                session,
             }
         );
 
-        if (session) {
-            updateQuery.session(session);
-        }
-
-        const updatedProduct =
-            await updateQuery;
-
         if (!updatedProduct) {
             throw new Error(
-                `Insufficient stock for product ${product.name}`
+                `Insufficient stock or product unavailable: ${product.name}`
             );
         }
 
-        // --------------------------------------------------
-        // 11. Create stock movement
-        // --------------------------------------------------
-
+        // 11. Create stock movement in the same transaction.
         const movementData = {
             tenantId: user.tenantId,
-
             productId: product._id,
-
+            ...(input.type === "adjustment" && operationId
+                ? { operationId }
+                : {}),
             type: input.type,
-
             quantity: input.quantity,
-
             referenceId: input.referenceId
-                ? new mongoose.Types.ObjectId(
-                    input.referenceId
-                )
+                ? new mongoose.Types.ObjectId(input.referenceId)
                 : undefined,
-
             previousStock,
-
             newStock,
-
             warehouse: {
                 name: input.warehouse.name.trim(),
-
-                location:
-                    input.warehouse.location?.trim(),
+                location: input.warehouse.location?.trim(),
             },
-
-            reason: input.reason,
-
+            reason: input.reason?.trim(),
             createdBy: user.userId,
         };
 
-        let movement;
+        // Do not catch duplicate-key errors here: the transaction
+        // owner must be allowed to abort the transaction.
+        const [movement] = await StockMovement.create(
+            [movementData],
+            { session }
+        );
 
-        if (session) {
-            const result =
-                await StockMovement.create(
-                    [movementData],
-                    { session }
-                );
-
-            movement = result[0];
-        } else {
-            movement =
-                await StockMovement.create(
-                    movementData
-                );
-        }
-
-        // --------------------------------------------------
-        // --------------------------------------------------
-        // 12. Create audit log for stock adjustment
-        // --------------------------------------------------
-
-        let auditLog;
+        // 12. Record audit history for manual adjustments.
+        // An audit failure must roll back the stock update and
+        // movement because all three writes share this session.
+        let auditLog: unknown;
 
         if (input.type === "adjustment") {
             auditLog = await AuditLogService.createAuditLog(
@@ -280,16 +336,14 @@ export class StockService {
                     },
                     newValues: {
                         stockQuantity: newStock,
+                        operationId,
                     },
                 },
                 session
             );
         }
 
-        // --------------------------------------------------
-        // 13. Return result
-        // --------------------------------------------------
-
+        // 13. Return the result.
         return {
             product: updatedProduct,
             movement,
@@ -297,6 +351,7 @@ export class StockService {
             newStock,
             quantityChanged: input.quantity,
             auditLog,
+            alreadyProcessed: false,
         };
     }
 
@@ -315,14 +370,10 @@ export class StockService {
             _id: productId,
             tenantId: user.tenantId,
             status: "active",
-        }).select(
-            "_id name SKU stockQuantity unitId"
-        );
+        }).select("_id name SKU stockQuantity unitId");
 
         if (!product) {
-            throw new Error(
-                "Product not found or inactive"
-            );
+            throw new Error("Product not found or inactive");
         }
 
         return product;
@@ -346,66 +397,47 @@ export class StockService {
         }
     ) {
         const page = Math.max(
-            options?.page ?? 1,
+            Math.floor(options?.page ?? 1),
             1
         );
 
         const limit = Math.min(
             Math.max(
-                options?.limit ?? 20,
+                Math.floor(options?.limit ?? 20),
                 1
             ),
             100
         );
 
-        const filter: Record<
-            string,
-            unknown
-        > = {
+        const filter: Record<string, unknown> = {
             tenantId: user.tenantId,
         };
 
-        // Filter by product
         if (options?.productId) {
-            if (
-                !mongoose.isValidObjectId(
-                    options.productId
-                )
-            ) {
-                throw new Error(
-                    "Invalid product ID"
-                );
+            if (!mongoose.isValidObjectId(options.productId)) {
+                throw new Error("Invalid product ID");
             }
 
-            filter.productId =
-                new mongoose.Types.ObjectId(
-                    options.productId
-                );
+            filter.productId = new mongoose.Types.ObjectId(
+                options.productId
+            );
         }
 
-        // Filter by movement type
         if (options?.type) {
             filter.type = options.type;
         }
 
-        const skip =
-            (page - 1) * limit;
+        const skip = (page - 1) * limit;
 
-        const [movements, total] =
-            await Promise.all([
-                StockMovement.find(filter)
-                    .sort({
-                        createdAt: -1,
-                        _id: -1,
-                    })
-                    .skip(skip)
-                    .limit(limit)
-                    .lean(),
+        const [movements, total] = await Promise.all([
+            StockMovement.find(filter)
+                .sort({ createdAt: -1, _id: -1 })
+                .skip(skip)
+                .limit(limit)
+                .lean(),
 
-                StockMovement.countDocuments(
-                    filter
-                ),
-            ]);
+            StockMovement.countDocuments(filter),
+        ]);
 
         return {
             movements,
@@ -413,8 +445,7 @@ export class StockService {
                 page,
                 limit,
                 total,
-                totalPages:
-                    Math.ceil(total / limit),
+                totalPages: Math.ceil(total / limit),
             },
         };
     }

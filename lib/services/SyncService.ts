@@ -1,415 +1,1153 @@
+
+import {
+    SalesService,
+    type CreateSaleInput,
+} from "@/lib/services/SalesService";
+
+import {
+    PurchaseService,
+    type CreatePurchaseInput,
+} from "@/lib/services/PurchaseService";
+
+import {
+    SalesReturnService,
+    type CreateSalesReturnInput,
+} from "@/lib/services/SalesReturnService";
+
+import {
+    PurchaseReturnService,
+    type CreatePurchaseReturnInput,
+} from "@/lib/services/PurchaseReturnService";
+
+import {
+    PaymentService,
+    type CreatePaymentInput,
+} from "@/lib/services/PaymentService";
+
+import { StockService } from "./StockService";
+import { Device } from "../models/Device";
 import mongoose from "mongoose";
+import { SyncOperation } from "../models/SyncOperation";
+import { randomUUID } from "crypto";
+import {
+    MAX_SYNC_ATTEMPTS,
+    SYNC_LEASE_MS,
+    SyncProcessError,
+    classifySyncError,
+    statusAfterFailure,
+} from "./SyncErrors";
 
-import { SyncOperation } from "@/lib/models/SyncOperation";
-import { Device } from "@/lib/models/Device";
-
-import { SalesService } from "@/lib/services/SalesService";
-import { PurchaseService } from "@/lib/services/PurchaseService";
-import { SalesReturnService } from "@/lib/services/SalesReturnService";
-import { PurchaseReturnService } from "@/lib/services/PurchaseReturnService";
-import { PaymentService } from "@/lib/services/PaymentService";
+// ============================================================
+// TYPES
+// ============================================================
 
 export interface SyncUserContext {
     tenantId: mongoose.Types.ObjectId;
+    // Identity of the authenticated session processing the operation.
+    userId: mongoose.Types.ObjectId;
+    deviceId: mongoose.Types.ObjectId;
 }
 
+// ============================================================
+// PAYLOAD VALIDATION HELPERS
+// ============================================================
+
+function getPayloadObject(
+    value: unknown
+): Record<string, unknown> {
+    if (
+        value === null ||
+        typeof value !== "object" ||
+        Array.isArray(value)
+    ) {
+        throw new Error("Sync payload must be an object");
+    }
+
+    return value as Record<string, unknown>;
+}
+
+function requiredString(
+    value: unknown,
+    field: string
+): string {
+    if (
+        typeof value !== "string" ||
+        !value.trim()
+    ) {
+        throw new Error(
+            `Invalid or missing field: ${field}`
+        );
+    }
+
+    return value.trim();
+}
+
+function optionalString(
+    value: unknown,
+    field: string
+): string | undefined {
+    if (
+        value === undefined ||
+        value === null
+    ) {
+        return undefined;
+    }
+
+    if (typeof value !== "string") {
+        throw new Error(
+            `Invalid field: ${field}`
+        );
+    }
+
+    return value;
+}
+
+function requiredNumber(
+    value: unknown,
+    field: string
+): number {
+    if (
+        typeof value !== "number" ||
+        !Number.isFinite(value)
+    ) {
+        throw new Error(
+            `Invalid or missing number: ${field}`
+        );
+    }
+
+    return value;
+}
+
+function optionalNumber(
+    value: unknown,
+    field: string
+): number | undefined {
+    if (
+        value === undefined ||
+        value === null
+    ) {
+        return undefined;
+    }
+
+    return requiredNumber(value, field);
+}
+
+function optionalDate(
+    value: unknown,
+    field: string
+): Date | undefined {
+    if (
+        value === undefined ||
+        value === null ||
+        value === ""
+    ) {
+        return undefined;
+    }
+
+    if (
+        typeof value !== "string" &&
+        !(value instanceof Date)
+    ) {
+        throw new Error(
+            `Invalid date: ${field}`
+        );
+    }
+
+    const date = new Date(value);
+
+    if (!Number.isFinite(date.getTime())) {
+        throw new Error(
+            `Invalid date: ${field}`
+        );
+    }
+
+    return date;
+}
+
+function requiredWarehouse(
+    value: unknown
+): {
+    name: string;
+    location?: string;
+} {
+    const warehouse = getPayloadObject(value);
+
+    return {
+        name: requiredString(
+            warehouse.name,
+            "warehouse.name"
+        ),
+        location: optionalString(
+            warehouse.location,
+            "warehouse.location"
+        ),
+    };
+}
+
+function requiredItems<T>(
+    value: unknown,
+    parser: (
+        item: unknown,
+        index: number
+    ) => T
+): T[] {
+    if (
+        !Array.isArray(value) ||
+        value.length === 0
+    ) {
+        throw new Error(
+            "At least one item is required"
+        );
+    }
+
+    return value.map(parser);
+}
+
+// ============================================================
+// SALE PAYLOAD
+// ============================================================
+
+function parseSalePayload(
+    value: unknown
+): CreateSaleInput {
+    const p = getPayloadObject(value);
+
+    const allowedPaymentMethods = [
+        "cash",
+        "bank",
+        "upi",
+        "card",
+        "credit",
+    ] as const;
+
+    if (
+        p.paymentMethod !== undefined &&
+        !allowedPaymentMethods.includes(
+            p.paymentMethod as
+            (typeof allowedPaymentMethods)[number]
+        )
+    ) {
+        throw new Error(
+            "Invalid sale payment method"
+        );
+    }
+
+    return {
+        invoiceNo: requiredString(
+            p.invoiceNo,
+            "invoiceNo"
+        ),
+
+        customerId: optionalString(
+            p.customerId,
+            "customerId"
+        ),
+
+        saleDate: optionalDate(
+            p.saleDate,
+            "saleDate"
+        ),
+
+        warehouse: requiredWarehouse(
+            p.warehouse
+        ),
+
+        items: requiredItems(
+            p.items,
+            (value, index) => {
+                const item =
+                    getPayloadObject(value);
+
+                return {
+                    productId: requiredString(
+                        item.productId,
+                        `items[${index}].productId`
+                    ),
+
+                    quantity: requiredNumber(
+                        item.quantity,
+                        `items[${index}].quantity`
+                    ),
+
+                    unitPrice: optionalNumber(
+                        item.unitPrice,
+                        `items[${index}].unitPrice`
+                    ),
+
+                    discountRate: optionalNumber(
+                        item.discountRate,
+                        `items[${index}].discountRate`
+                    ),
+
+                    taxRate: optionalNumber(
+                        item.taxRate,
+                        `items[${index}].taxRate`
+                    ),
+                };
+            }
+        ),
+
+        paidAmount: optionalNumber(
+            p.paidAmount,
+            "paidAmount"
+        ),
+
+        paymentMethod:
+            p.paymentMethod as
+            CreateSaleInput["paymentMethod"],
+
+        notes: optionalString(
+            p.notes,
+            "notes"
+        ),
+    };
+}
+
+// ============================================================
+// PURCHASE PAYLOAD
+// ============================================================
+
+function parsePurchasePayload(
+    value: unknown
+): CreatePurchaseInput {
+    const p = getPayloadObject(value);
+
+    const allowedPaymentStatuses = [
+        "unpaid",
+        "partial",
+        "paid",
+    ] as const;
+
+    if (
+        p.paymentStatus !== undefined &&
+        !allowedPaymentStatuses.includes(
+            p.paymentStatus as
+            (typeof allowedPaymentStatuses)[number]
+        )
+    ) {
+        throw new Error(
+            "Invalid purchase payment status"
+        );
+    }
+
+    return {
+        purchaseNo: requiredString(
+            p.purchaseNo,
+            "purchaseNo"
+        ),
+
+        supplierId: requiredString(
+            p.supplierId,
+            "supplierId"
+        ),
+
+        purchaseDate: optionalDate(
+            p.purchaseDate,
+            "purchaseDate"
+        ),
+
+        supplierInvoiceNo: optionalString(
+            p.supplierInvoiceNo,
+            "supplierInvoiceNo"
+        ),
+
+        supplierInvoiceDate: optionalDate(
+            p.supplierInvoiceDate,
+            "supplierInvoiceDate"
+        ),
+
+        dueDate: optionalDate(
+            p.dueDate,
+            "dueDate"
+        ),
+
+        warehouse: requiredWarehouse(
+            p.warehouse
+        ),
+
+        items: requiredItems(
+            p.items,
+            (value, index) => {
+                const item =
+                    getPayloadObject(value);
+
+                return {
+                    productId: requiredString(
+                        item.productId,
+                        `items[${index}].productId`
+                    ),
+
+                    quantity: requiredNumber(
+                        item.quantity,
+                        `items[${index}].quantity`
+                    ),
+
+                    unitPrice: requiredNumber(
+                        item.unitPrice,
+                        `items[${index}].unitPrice`
+                    ),
+
+                    discountRate: optionalNumber(
+                        item.discountRate,
+                        `items[${index}].discountRate`
+                    ),
+
+                    taxRate: optionalNumber(
+                        item.taxRate,
+                        `items[${index}].taxRate`
+                    ),
+                };
+            }
+        ),
+
+        shippingCost: optionalNumber(
+            p.shippingCost,
+            "shippingCost"
+        ),
+
+        paidAmount: optionalNumber(
+            p.paidAmount,
+            "paidAmount"
+        ),
+
+        paymentStatus:
+            p.paymentStatus as
+            CreatePurchaseInput["paymentStatus"],
+
+        notes: optionalString(
+            p.notes,
+            "notes"
+        ),
+    };
+}
+
+// ============================================================
+// SALES RETURN PAYLOAD
+// ============================================================
+
+function parseSalesReturnPayload(
+    value: unknown
+): CreateSalesReturnInput {
+    const p = getPayloadObject(value);
+
+    const allowedRefundStatuses = [
+        "pending",
+        "refunded",
+        "not_applicable",
+    ] as const;
+
+    if (
+        p.refundStatus !== undefined &&
+        !allowedRefundStatuses.includes(
+            p.refundStatus as
+            (typeof allowedRefundStatuses)[number]
+        )
+    ) {
+        throw new Error(
+            "Invalid sales return refund status"
+        );
+    }
+
+    return {
+        salesReturnNo: requiredString(
+            p.salesReturnNo,
+            "salesReturnNo"
+        ),
+
+        saleId: requiredString(
+            p.saleId,
+            "saleId"
+        ),
+
+        customerId: optionalString(
+            p.customerId,
+            "customerId"
+        ),
+
+        returnDate: optionalDate(
+            p.returnDate,
+            "returnDate"
+        ),
+
+        warehouse: requiredWarehouse(
+            p.warehouse
+        ),
+
+        items: requiredItems(
+            p.items,
+            (value, index) => {
+                const item =
+                    getPayloadObject(value);
+
+                return {
+                    productId: requiredString(
+                        item.productId,
+                        `items[${index}].productId`
+                    ),
+
+                    quantity: requiredNumber(
+                        item.quantity,
+                        `items[${index}].quantity`
+                    ),
+                };
+            }
+        ),
+
+        refundAmount: optionalNumber(
+            p.refundAmount,
+            "refundAmount"
+        ),
+
+        refundStatus:
+            p.refundStatus as
+            CreateSalesReturnInput["refundStatus"],
+
+        reason: optionalString(
+            p.reason,
+            "reason"
+        ),
+
+        notes: optionalString(
+            p.notes,
+            "notes"
+        ),
+    };
+}
+
+// ============================================================
+// PURCHASE RETURN PAYLOAD
+// ============================================================
+
+function parsePurchaseReturnPayload(
+    value: unknown
+): CreatePurchaseReturnInput {
+    const p = getPayloadObject(value);
+
+    const allowedRefundStatuses = [
+        "pending",
+        "refunded",
+        "not_applicable",
+    ] as const;
+
+    if (
+        p.refundStatus !== undefined &&
+        !allowedRefundStatuses.includes(
+            p.refundStatus as
+            (typeof allowedRefundStatuses)[number]
+        )
+    ) {
+        throw new Error(
+            "Invalid purchase return refund status"
+        );
+    }
+
+    return {
+        purchaseReturnNo: requiredString(
+            p.purchaseReturnNo,
+            "purchaseReturnNo"
+        ),
+
+        purchaseId: requiredString(
+            p.purchaseId,
+            "purchaseId"
+        ),
+
+        returnDate: optionalDate(
+            p.returnDate,
+            "returnDate"
+        ),
+
+        warehouse: requiredWarehouse(
+            p.warehouse
+        ),
+
+        items: requiredItems(
+            p.items,
+            (value, index) => {
+                const item =
+                    getPayloadObject(value);
+
+                return {
+                    productId: requiredString(
+                        item.productId,
+                        `items[${index}].productId`
+                    ),
+
+                    quantity: requiredNumber(
+                        item.quantity,
+                        `items[${index}].quantity`
+                    ),
+                };
+            }
+        ),
+
+        refundAmount: optionalNumber(
+            p.refundAmount,
+            "refundAmount"
+        ),
+
+        refundStatus:
+            p.refundStatus as
+            CreatePurchaseReturnInput["refundStatus"],
+
+        reason: optionalString(
+            p.reason,
+            "reason"
+        ),
+
+        notes: optionalString(
+            p.notes,
+            "notes"
+        ),
+    };
+}
+
+// ============================================================
+// PAYMENT PAYLOAD
+// ============================================================
+
+function parsePaymentPayload(
+    value: unknown
+): CreatePaymentInput {
+    const p = getPayloadObject(value);
+
+    const allowedTypes = [
+        "receipt",
+        "payment",
+        "sales_refund",
+        "purchase_refund",
+    ] as const;
+
+    const allowedMethods = [
+        "cash",
+        "upi",
+        "card",
+        "bank",
+        "credit",
+        "other",
+    ] as const;
+
+    const allowedStatuses = [
+        "pending",
+        "completed",
+        "failed",
+        "cancelled",
+    ] as const;
+
+    if (
+        !allowedTypes.includes(
+            p.type as
+            (typeof allowedTypes)[number]
+        )
+    ) {
+        throw new Error(
+            "Invalid payment type"
+        );
+    }
+
+    if (
+        !allowedMethods.includes(
+            p.paymentMethod as
+            (typeof allowedMethods)[number]
+        )
+    ) {
+        throw new Error(
+            "Invalid payment method"
+        );
+    }
+
+    if (
+        p.status !== undefined &&
+        !allowedStatuses.includes(
+            p.status as
+            (typeof allowedStatuses)[number]
+        )
+    ) {
+        throw new Error(
+            "Invalid payment status"
+        );
+    }
+
+    return {
+        paymentNo: requiredString(
+            p.paymentNo,
+            "paymentNo"
+        ),
+
+        type: p.type as
+            CreatePaymentInput["type"],
+
+        amount: requiredNumber(
+            p.amount,
+            "amount"
+        ),
+
+        paymentMethod: p.paymentMethod as
+            CreatePaymentInput["paymentMethod"],
+
+        paymentDate: optionalDate(
+            p.paymentDate,
+            "paymentDate"
+        ),
+
+        customerId: optionalString(
+            p.customerId,
+            "customerId"
+        ),
+
+        supplierId: optionalString(
+            p.supplierId,
+            "supplierId"
+        ),
+
+        saleId: optionalString(
+            p.saleId,
+            "saleId"
+        ),
+
+        purchaseId: optionalString(
+            p.purchaseId,
+            "purchaseId"
+        ),
+
+        salesReturnId: optionalString(
+            p.salesReturnId,
+            "salesReturnId"
+        ),
+
+        purchaseReturnId: optionalString(
+            p.purchaseReturnId,
+            "purchaseReturnId"
+        ),
+
+        referenceNo: optionalString(
+            p.referenceNo,
+            "referenceNo"
+        ),
+
+        notes: optionalString(
+            p.notes,
+            "notes"
+        ),
+
+        status: p.status as
+            CreatePaymentInput["status"],
+    };
+}
+
+// ============================================================
+// STOCK ADJUSTMENT PAYLOAD
+// ============================================================
+
+function parseStockAdjustmentPayload(
+    value: unknown
+): {
+    productId: string;
+    quantity: number;
+    warehouse: {
+        name: string;
+        location?: string;
+    };
+    reason: string;
+} {
+    const p = getPayloadObject(value);
+
+    return {
+        productId: requiredString(
+            p.productId,
+            "productId"
+        ),
+
+        quantity: requiredNumber(
+            p.quantity,
+            "quantity"
+        ),
+
+        warehouse: requiredWarehouse(
+            p.warehouse
+        ),
+
+        reason: requiredString(
+            p.reason,
+            "reason"
+        ),
+    };
+}
+
+// ============================================================
+// SYNC SERVICE
+// ============================================================
+
 export class SyncService {
+    /**
+     * Process one uploaded operation for the CURRENT session.
+     *
+     * Safety rules:
+     * - Only the uploading user on the uploading device may process it.
+     * - Claims are atomic and leased: a crashed worker's claim expires and
+     *   can be reclaimed. Every business operation below is idempotent per
+     *   operationId, so re-running a reclaimed operation never duplicates
+     *   sales, stock movements or payments.
+     * - Temporary failures may be retried (bounded); permanent business
+     *   failures go to NEEDS_ATTENTION and are never retried automatically.
+     */
     static async processOperation(
         user: SyncUserContext,
         operationId: string
     ) {
-        // ----------------------------------------------------------
-        // 1. Validate tenant
-        // ----------------------------------------------------------
+        const normalizedOperationId = operationId?.trim();
 
-        if (!user.tenantId) {
-            throw new Error(
-                "Tenant context is required"
-            );
+        if (!user.tenantId || !user.userId || !user.deviceId) {
+            throw new SyncProcessError(401, "INVALID_REQUEST", "Session context is required", false);
         }
 
-        // ----------------------------------------------------------
-        // 2. Validate operation ID
-        // ----------------------------------------------------------
-
-        if (!operationId?.trim()) {
-            throw new Error(
-                "Operation ID is required"
-            );
+        if (!normalizedOperationId) {
+            throw new SyncProcessError(400, "INVALID_REQUEST", "Operation ID is required", false);
         }
 
-        const normalizedOperationId =
-            operationId.trim();
-
-        // ----------------------------------------------------------
-        // 3. Find sync operation
-        // ----------------------------------------------------------
-
-        const existingOperation =
-            await SyncOperation.findOne({
-                tenantId:
-                    user.tenantId,
-
-                operationId:
-                    normalizedOperationId,
-            });
+        // 1. Find the operation inside the caller's tenant only.
+        const existingOperation = await SyncOperation.findOne({
+            tenantId: user.tenantId,
+            operationId: normalizedOperationId,
+        });
 
         if (!existingOperation) {
-            throw new Error(
-                "Sync operation not found"
-            );
+            throw new SyncProcessError(404, "NOT_FOUND", "Sync operation not found", true);
         }
 
-        // ----------------------------------------------------------
-        // 4. Already synced
-        // ----------------------------------------------------------
-
+        // 2. Only the uploading user on the uploading device may process it.
+        //    Legacy records have no userId: then the session's device must
+        //    be the operation's device (checked below against its owner).
         if (
-            existingOperation.status ===
-            "SYNCED"
+            !existingOperation.deviceId.equals(user.deviceId) ||
+            (existingOperation.userId && !existingOperation.userId.equals(user.userId))
         ) {
-            return {
-                success: true,
-
-                alreadySynced: true,
-
-                operation:
-                    existingOperation,
-            };
-        }
-
-        // ----------------------------------------------------------
-        // 5. Already processing
-        // ----------------------------------------------------------
-
-        if (
-            existingOperation.status ===
-            "PROCESSING"
-        ) {
-            throw new Error(
-                "Sync operation is already being processed"
+            throw new SyncProcessError(
+                403,
+                "OWNER_MISMATCH",
+                "This operation belongs to another user or device",
+                false
             );
         }
 
-        // ----------------------------------------------------------
-        // 6. Claim operation
-        // ----------------------------------------------------------
+        // 3. Terminal states.
+        if (existingOperation.status === "SYNCED") {
+            return { success: true, alreadySynced: true, operation: existingOperation };
+        }
 
-        const operation =
-            await SyncOperation.findOneAndUpdate(
-                {
-                    _id:
-                        existingOperation._id,
-
-                    tenantId:
-                        user.tenantId,
-
-                    status: {
-                        $in: [
-                            "PENDING",
-                            "FAILED",
-                        ],
-                    },
-                },
-                {
-                    $set: {
-                        status:
-                            "PROCESSING",
-
-                        lastAttemptAt:
-                            new Date(),
-
-                        errorMessage:
-                            undefined,
-                    },
-
-                    $inc: {
-                        attempts: 1,
-                    },
-                },
-                {
-                    new: true,
-                }
+        if (existingOperation.status === "NEEDS_ATTENTION" || existingOperation.status === "CANCELLED") {
+            throw new SyncProcessError(
+                422,
+                "NEEDS_ATTENTION",
+                existingOperation.errorMessage
+                    ? `Operation needs attention: ${existingOperation.errorMessage}`
+                    : "Operation needs attention and will not be retried automatically",
+                false
             );
+        }
+
+        // 4. Too many attempts already: stop retrying.
+        if (existingOperation.status === "FAILED" && existingOperation.attempts >= MAX_SYNC_ATTEMPTS) {
+            await SyncOperation.updateOne(
+                { _id: existingOperation._id, tenantId: user.tenantId, status: "FAILED" },
+                { $set: { status: "NEEDS_ATTENTION", failureKind: "RETRIES_EXHAUSTED" } }
+            );
+            throw new SyncProcessError(
+                422,
+                "NEEDS_ATTENTION",
+                "Operation failed too many times and needs attention",
+                false
+            );
+        }
+
+        // 5. Claim atomically with a lease. Claimable: PENDING, FAILED, or a
+        //    PROCESSING claim whose lease expired (crashed/stalled worker).
+        //    Legacy PROCESSING records without a lease are reclaimable once
+        //    their last attempt is older than the lease duration.
+        const now = new Date();
+        const leaseToken = randomUUID();
+        const operation = await SyncOperation.findOneAndUpdate(
+            {
+                _id: existingOperation._id,
+                tenantId: user.tenantId,
+                attempts: { $lt: MAX_SYNC_ATTEMPTS },
+                $or: [
+                    { status: { $in: ["PENDING", "FAILED"] } },
+                    { status: "PROCESSING", leaseExpiresAt: { $lt: now } },
+                    {
+                        status: "PROCESSING",
+                        leaseExpiresAt: { $exists: false },
+                        lastAttemptAt: { $lt: new Date(now.getTime() - SYNC_LEASE_MS) },
+                    },
+                ],
+            },
+            {
+                $set: {
+                    status: "PROCESSING",
+                    lastAttemptAt: now,
+                    leaseToken,
+                    leaseExpiresAt: new Date(now.getTime() + SYNC_LEASE_MS),
+                },
+                $unset: { errorMessage: "", failureKind: "" },
+                $inc: { attempts: 1 },
+            },
+            { returnDocument: "after" }
+        );
 
         if (!operation) {
-            throw new Error(
-                "Sync operation could not be claimed. It may already be processing."
-            );
+            const current = await SyncOperation.findById(existingOperation._id).lean();
+
+            if (current?.status === "SYNCED") {
+                return { success: true, alreadySynced: true, operation: current };
+            }
+
+            if (current?.status === "PROCESSING") {
+                const waitMs = current.leaseExpiresAt
+                    ? current.leaseExpiresAt.getTime() - Date.now()
+                    : SYNC_LEASE_MS;
+                throw new SyncProcessError(
+                    409,
+                    "IN_PROGRESS",
+                    "Operation is already being processed",
+                    true,
+                    Math.max(1, Math.ceil(waitMs / 1000))
+                );
+            }
+
+            if (current?.status === "NEEDS_ATTENTION" || (current && current.attempts >= MAX_SYNC_ATTEMPTS)) {
+                throw new SyncProcessError(422, "NEEDS_ATTENTION", "Operation needs attention", false);
+            }
+
+            throw new SyncProcessError(409, "IN_PROGRESS", "Operation could not be claimed; try again", true, 5);
         }
 
         try {
-            // ------------------------------------------------------
-            // 7. Validate device
-            // ------------------------------------------------------
-
-            const device =
-                await Device.findOne({
-                    _id:
-                        operation.deviceId,
-
-                    tenantId:
-                        user.tenantId,
-
-                    status:
-                        "active",
-                }).lean();
+            // 6. The device must still be active in this tenant and, for
+            //    legacy records, belong to the session's user.
+            const device = await Device.findOne({
+                _id: operation.deviceId,
+                tenantId: user.tenantId,
+                status: "active",
+            }).lean();
 
             if (!device) {
-                throw new Error(
-                    "Sync device not found, inactive, or does not belong to this tenant"
+                throw new Error("Sync device not found, inactive, or does not belong to this tenant");
+            }
+
+            if (!operation.userId && !device.userId.equals(user.userId)) {
+                throw new SyncProcessError(
+                    403,
+                    "OWNER_MISMATCH",
+                    "This operation belongs to another user or device",
+                    false
                 );
             }
 
-            // ------------------------------------------------------
-            // 8. Build business user context
-            // ------------------------------------------------------
-
+            // 7. Business effects are attributed to the uploading user.
             const businessUser = {
-                userId:
-                    device.userId,
-
-                tenantId:
-                    user.tenantId,
+                userId: operation.userId ?? device.userId,
+                tenantId: user.tenantId,
             };
 
-            // ------------------------------------------------------
-            // 9. Validate payload
-            // ------------------------------------------------------
+            const payload = getPayloadObject(operation.payload);
 
-            const payload =
-                operation.payload;
+            // 8. Idempotent business operation (see the per-entity services).
+            await SyncService.runBusinessOperation(businessUser, operation.entityType, payload, operation.operationId);
 
-            if (
-                !payload ||
-                typeof payload !==
-                "object"
-            ) {
-                throw new Error(
-                    "Sync operation payload is invalid"
-                );
-            }
-
-            // ------------------------------------------------------
-            // 10. Process business operation
-            // ------------------------------------------------------
-
-            switch (
-            operation.entityType
-            ) {
-                // ==================================================
-                // SALE
-                // ==================================================
-
-                case "Sale": {
-                    /*
-                     * IMPORTANT:
-                     *
-                     * We do NOT trust an operationId supplied
-                     * inside the payload.
-                     *
-                     * The canonical operationId comes from the
-                     * SyncOperation document itself.
-                     */
-
-                    await SalesService.createSale(
-                        businessUser,
-
-                        payload as any,
-
-                        operation.operationId
-                    );
-
-                    break;
-                }
-
-                // ==================================================
-                // PURCHASE
-                // ==================================================
-
-                case "Purchase": {
-                    await PurchaseService.createPurchase(
-                        businessUser,
-                        payload as any,
-                        operation.operationId
-                    );
-
-                    break;
-                }
-
-                // ==================================================
-                // SALES RETURN
-                // ==================================================
-
-                case "SalesReturn": {
-                    await SalesReturnService.createSalesReturn(
-                        businessUser,
-
-                        payload as any
-                    );
-
-                    break;
-                }
-
-                // ==================================================
-                // PURCHASE RETURN
-                // ==================================================
-
-                case "PurchaseReturn": {
-                    await PurchaseReturnService.createPurchaseReturn(
-                        businessUser,
-                        payload as any,
-                        operation.operationId
-                    );
-
-                    break;
-                }
-                // ==================================================
-                // PAYMENT
-                // ==================================================
-
-                case "Payment": {
-                    await PaymentService.createPayment(
-                        businessUser,
-
-                        payload as any
-                    );
-
-                    break;
-                }
-
-                // ==================================================
-                // CUSTOMER
-                // ==================================================
-
-                case "Customer": {
-                    throw new Error(
-                        "Customer synchronization is not implemented yet"
-                    );
-                }
-
-                // ==================================================
-                // SUPPLIER
-                // ==================================================
-
-                case "Supplier": {
-                    throw new Error(
-                        "Supplier synchronization is not implemented yet"
-                    );
-                }
-
-                // ==================================================
-                // PRODUCT
-                // ==================================================
-
-                case "Product": {
-                    throw new Error(
-                        "Product synchronization is not implemented yet"
-                    );
-                }
-
-                // ==================================================
-                // UNSUPPORTED
-                // ==================================================
-
-                default: {
-                    throw new Error(
-                        `Unsupported sync entity: ${operation.entityType}`
-                    );
-                }
-            }
-
-            // ------------------------------------------------------
-            // 11. Mark sync operation as SYNCED
-            // ------------------------------------------------------
-
-            const syncedOperation =
-                await SyncOperation.findOneAndUpdate(
+            // 9. Mark SYNCED. Normally only the lease holder may do this. If
+            //    the lease expired meanwhile and another worker reclaimed the
+            //    operation, the effect is already committed (idempotent), so
+            //    it is still safe to mark it SYNCED.
+            const synced =
+                (await SyncOperation.findOneAndUpdate(
+                    { _id: operation._id, tenantId: user.tenantId, status: "PROCESSING", leaseToken },
                     {
-                        _id:
-                            operation._id,
-
-                        tenantId:
-                            user.tenantId,
-
-                        status:
-                            "PROCESSING",
+                        $set: { status: "SYNCED", syncedAt: new Date() },
+                        $unset: { errorMessage: "", failureKind: "", leaseToken: "", leaseExpiresAt: "" },
                     },
+                    { returnDocument: "after" }
+                )) ??
+                (await SyncOperation.findOneAndUpdate(
+                    { _id: operation._id, tenantId: user.tenantId, status: { $in: ["PROCESSING", "SYNCED"] } },
                     {
-                        $set: {
-                            status:
-                                "SYNCED",
-
-                            syncedAt:
-                                new Date(),
-                        },
-
-                        $unset: {
-                            errorMessage:
-                                "",
-                        },
+                        $set: { status: "SYNCED", syncedAt: new Date() },
+                        $unset: { errorMessage: "", failureKind: "", leaseToken: "", leaseExpiresAt: "" },
                     },
-                    {
-                        new: true,
-                    }
-                );
+                    { returnDocument: "after" }
+                ));
 
-            if (!syncedOperation) {
-                throw new Error(
-                    "Operation was processed but could not be marked as SYNCED"
+            if (!synced) {
+                // The business effect is committed, but the status could not
+                // be recorded. Report a temporary failure: a later retry
+                // reclaims the expired lease, finds the existing record
+                // (idempotent) and marks it SYNCED.
+                throw new SyncProcessError(
+                    503,
+                    "RETRYABLE_FAILURE",
+                    "Operation was applied but its sync status could not be saved; retry later",
+                    true
                 );
             }
 
-            // ------------------------------------------------------
-            // 12. Return result
-            // ------------------------------------------------------
-
-            return {
-                success: true,
-
-                alreadySynced: false,
-
-                operation:
-                    syncedOperation,
-            };
+            return { success: true, alreadySynced: false, operation: synced };
         } catch (error: unknown) {
-            // ------------------------------------------------------
-            // 13. Save failure information
-            // ------------------------------------------------------
+            if (error instanceof SyncProcessError && error.code === "RETRYABLE_FAILURE") {
+                // Leave the lease in place; it expires and the retry recovers.
+                throw error;
+            }
 
-            const errorMessage =
-                error instanceof Error
-                    ? error.message
-                    : "Unknown sync error";
+            const kind =
+                error instanceof SyncProcessError
+                    ? error.retryable ? "RETRYABLE" : "PERMANENT"
+                    : classifySyncError(error);
+            const next = statusAfterFailure(kind, operation.attempts);
+            const errorMessage = error instanceof Error ? error.message : "Unknown sync error";
 
-            await SyncOperation.findOneAndUpdate(
+            // Release the lease (only if we still hold it).
+            await SyncOperation.updateOne(
+                { _id: operation._id, tenantId: user.tenantId, status: "PROCESSING", leaseToken },
                 {
-                    _id:
-                        operation._id,
-
-                    tenantId:
-                        user.tenantId,
-
-                    status:
-                        "PROCESSING",
-                },
-                {
-                    $set: {
-                        status:
-                            "FAILED",
-
-                        errorMessage,
-                    },
+                    $set: { status: next.status, failureKind: next.failureKind, errorMessage },
+                    $unset: { leaseToken: "", leaseExpiresAt: "" },
                 }
-            );
+            ).catch(() => {
+                // The lease simply expires; a later attempt recovers.
+            });
 
-            // ------------------------------------------------------
-            // 14. Throw sync error
-            // ------------------------------------------------------
+            if (error instanceof SyncProcessError) {
+                throw error;
+            }
 
-            throw new Error(
-                `Sync failed: ${errorMessage}`
+            if (next.status === "NEEDS_ATTENTION") {
+                throw new SyncProcessError(
+                    422,
+                    kind === "PERMANENT" ? "PERMANENT_FAILURE" : "NEEDS_ATTENTION",
+                    kind === "PERMANENT"
+                        ? `Sync failed permanently: ${errorMessage}`
+                        : "Sync failed too many times and needs attention",
+                    false
+                );
+            }
+
+            throw new SyncProcessError(
+                503,
+                "RETRYABLE_FAILURE",
+                "Temporary problem while syncing; it will be retried",
+                true
             );
+        }
+    }
+
+    private static async runBusinessOperation(
+        businessUser: { userId: mongoose.Types.ObjectId; tenantId: mongoose.Types.ObjectId },
+        entityType: string,
+        payload: Record<string, unknown>,
+        operationId: string
+    ) {
+        const operation = { entityType, operationId };
+
+        switch (operation.entityType) {
+            case "Sale": {
+                await SalesService.createSale(
+                    businessUser,
+                    parseSalePayload(payload),
+                    operation.operationId
+                );
+                break;
+            }
+
+            case "Purchase": {
+                await PurchaseService.createPurchase(
+                    businessUser,
+                    parsePurchasePayload(payload),
+                    operation.operationId
+                );
+                break;
+            }
+
+            case "SalesReturn": {
+                await SalesReturnService.createSalesReturn(
+                    businessUser,
+                    parseSalesReturnPayload(payload),
+                    operation.operationId
+                );
+                break;
+            }
+
+            case "PurchaseReturn": {
+                await PurchaseReturnService.createPurchaseReturn(
+                    businessUser,
+                    parsePurchaseReturnPayload(payload),
+                    operation.operationId
+                );
+                break;
+            }
+
+            case "Payment": {
+                await PaymentService.createPayment(
+                    businessUser,
+                    parsePaymentPayload(payload),
+                    operation.operationId
+                );
+                break;
+            }
+
+            case "StockAdjustment": {
+                const stockAdjustment =
+                    parseStockAdjustmentPayload(payload);
+
+                await StockService.changeStock(
+                    businessUser,
+                    {
+                        productId:
+                            stockAdjustment.productId,
+
+                        quantity:
+                            stockAdjustment.quantity,
+
+                        type: "adjustment",
+
+                        warehouse: {
+                            name:
+                                stockAdjustment.warehouse.name,
+
+                            location:
+                                stockAdjustment.warehouse.location,
+                        },
+
+                        reason:
+                            stockAdjustment.reason,
+                    },
+                    undefined,
+                    operation.operationId
+                );
+
+                break;
+            }
+
+            case "Customer": {
+                throw new Error(
+                    "Customer synchronization is not implemented yet"
+                );
+            }
+
+            case "Supplier": {
+                throw new Error(
+                    "Supplier synchronization is not implemented yet"
+                );
+            }
+
+            case "Product": {
+                throw new Error(
+                    "Product synchronization is not implemented yet"
+                );
+            }
+
+            default: {
+                throw new Error(
+                    `Unsupported sync entity: ${operation.entityType}`
+                );
+            }
         }
     }
 }

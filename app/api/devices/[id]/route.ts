@@ -1,47 +1,81 @@
-import { NextResponse } from "next/server";
+
+import { NextRequest, NextResponse } from "next/server";
 import mongoose from "mongoose";
 
-import { connectDB } from "@/lib/db/mongodb";
 import { Device } from "@/lib/models/Device";
 import { AuditLogService } from "@/lib/services/AuditLogService";
+import { getAuthenticatedContext } from "@/lib/auth/getAuthenticatedContext";
+import { hasPermission } from "@/lib/auth/hasPermission";
 
-const TEST_TENANT_ID = "6abe48a86ae4b08a3e335303";
-const TEST_USER_ID = "6abe4d3f6ae4b08a3e335463";
+const ALLOWED_DEVICE_TYPES = [
+    "pos",
+    "desktop",
+    "laptop",
+    "tablet",
+    "mobile",
+    "other",
+] as const;
 
+type RouteContext = {
+    params: Promise<{ id: string }>;
+};
+
+function errorResponse(message: string, status: number) {
+    return NextResponse.json(
+        { success: false, message },
+        { status }
+    );
+}
+
+class DeviceNotFoundError extends Error { }
+
+function isObjectBody(
+    body: unknown
+): body is Record<string, unknown> {
+    return (
+        typeof body === "object" &&
+        body !== null &&
+        !Array.isArray(body)
+    );
+}
+
+// GET /api/devices/[id]
 export async function GET(
-    request: Request,
-    context: { params: Promise<{ id: string }> }
+    request: NextRequest,
+    routeContext: RouteContext
 ) {
     try {
-        await connectDB();
+        const context =
+            await getAuthenticatedContext(request);
 
-        const { id } = await context.params;
-
-        if (!mongoose.Types.ObjectId.isValid(id)) {
-            return NextResponse.json(
-                {
-                    success: false,
-                    message: "Invalid device ID",
-                },
-                { status: 400 }
-            );
+        if (!context) {
+            return errorResponse("Not authenticated", 401);
         }
 
-        const tenantId = new mongoose.Types.ObjectId(TEST_TENANT_ID);
+        const permitted = await hasPermission({
+            userId: context.userId,
+            tenantId: context.tenantId,
+            roleId: context.roleId,
+            permission: "devices.read",
+        });
+
+        if (!permitted) {
+            return errorResponse("Permission denied", 403);
+        }
+
+        const { id } = await routeContext.params;
+
+        if (!mongoose.Types.ObjectId.isValid(id)) {
+            return errorResponse("Invalid device ID", 400);
+        }
 
         const device = await Device.findOne({
             _id: id,
-            tenantId,
+            tenantId: context.tenantId,
         }).lean();
 
         if (!device) {
-            return NextResponse.json(
-                {
-                    success: false,
-                    message: "Device not found",
-                },
-                { status: 404 }
-            );
+            return errorResponse("Device not found", 404);
         }
 
         return NextResponse.json({
@@ -50,189 +84,232 @@ export async function GET(
         });
     } catch (error) {
         console.error("Device fetch error:", error);
-
-        return NextResponse.json(
-            {
-                success: false,
-                message: "Failed to fetch device",
-            },
-            { status: 500 }
-        );
+        return errorResponse("Failed to fetch device", 500);
     }
 }
 
+// PUT /api/devices/[id]
 export async function PUT(
-    request: Request,
-    context: { params: Promise<{ id: string }> }
+    request: NextRequest,
+    routeContext: RouteContext
 ) {
+    let session: mongoose.ClientSession | undefined;
+
     try {
-        await connectDB();
+        const context =
+            await getAuthenticatedContext(request);
 
-        const { id } = await context.params;
-
-        if (!mongoose.Types.ObjectId.isValid(id)) {
-            return NextResponse.json(
-                {
-                    success: false,
-                    message: "Invalid device ID",
-                },
-                { status: 400 }
-            );
+        if (!context) {
+            return errorResponse("Not authenticated", 401);
         }
 
-        const body = await request.json();
-
-        const {
-            deviceName,
-            deviceType,
-            status,
-        } = body;
-
-        const tenantId = new mongoose.Types.ObjectId(TEST_TENANT_ID);
-
-        const device = await Device.findOne({
-            _id: id,
-            tenantId,
+        const permitted = await hasPermission({
+            userId: context.userId,
+            tenantId: context.tenantId,
+            roleId: context.roleId,
+            permission: "devices.update",
         });
 
-        if (!device) {
-            return NextResponse.json(
-                {
-                    success: false,
-                    message: "Device not found",
-                },
-                { status: 404 }
+        if (!permitted) {
+            return errorResponse("Permission denied", 403);
+        }
+
+        const { id } = await routeContext.params;
+
+        if (!mongoose.Types.ObjectId.isValid(id)) {
+            return errorResponse("Invalid device ID", 400);
+        }
+
+        let body: unknown;
+
+        try {
+            body = await request.json();
+        } catch {
+            return errorResponse("Invalid JSON body", 400);
+        }
+
+        if (!isObjectBody(body)) {
+            return errorResponse(
+                "Request body must be an object",
+                400
             );
         }
 
-        // Save values BEFORE the update
-        const oldValues = {
-            deviceName: device.deviceName,
-            deviceType: device.deviceType,
-            status: device.status,
-        };
-
-        // Update device name
-        if (deviceName !== undefined) {
-            if (
-                typeof deviceName !== "string" ||
-                deviceName.trim().length === 0
-            ) {
-                return NextResponse.json(
-                    {
-                        success: false,
-                        message: "Device name must be a non-empty string",
-                    },
-                    { status: 400 }
-                );
-            }
-
-            device.deviceName = deviceName.trim();
-        }
-
-        // Update device type
-        if (deviceType !== undefined) {
-            const allowedDeviceTypes = [
-                "pos",
-                "desktop",
-                "laptop",
-                "tablet",
-                "mobile",
-                "other",
-            ];
-
-            if (!allowedDeviceTypes.includes(deviceType)) {
-                return NextResponse.json(
-                    {
-                        success: false,
-                        message: "Invalid device type",
-                    },
-                    { status: 400 }
-                );
-            }
-
-            device.deviceType = deviceType;
-        }
-
-        // Update status
-        if (status !== undefined) {
-            if (status !== "active" && status !== "inactive") {
-                return NextResponse.json(
-                    {
-                        success: false,
-                        message: "Invalid device status",
-                    },
-                    { status: 400 }
-                );
-            }
-
-            device.status = status;
-        }
-
-        // Save updated device
-        await device.save();
-
-        // Values AFTER the update
-        const newValues = {
-            deviceName: device.deviceName,
-            deviceType: device.deviceType,
-            status: device.status,
-        };
-
-        // Determine what kind of action happened
-        let action = "UPDATE";
+        const allowedFields = [
+            "deviceName",
+            "deviceType",
+            "status",
+        ];
 
         if (
-            oldValues.status === "active" &&
-            newValues.status === "inactive"
+            Object.keys(body).some(
+                (key) => !allowedFields.includes(key)
+            )
         ) {
-            action = "DEACTIVATE";
-        } else if (
-            oldValues.status === "inactive" &&
-            newValues.status === "active"
-        ) {
-            action = "ACTIVATE";
+            return errorResponse(
+                "Request contains unsupported fields",
+                400
+            );
         }
 
-        // Create audit log
-        const auditLog = await AuditLogService.createAuditLog(
-            {
-                userId: new mongoose.Types.ObjectId(TEST_USER_ID),
-                tenantId,
-                deviceId: device._id,
-            },
-            {
-                action,
-                entity: "Device",
-                entityId: device._id,
+        if (Object.keys(body).length === 0) {
+            return errorResponse(
+                "Provide at least one field to update",
+                400
+            );
+        }
 
-                description:
-                    action === "DEACTIVATE"
-                        ? `Device ${device.deviceName} deactivated`
-                        : action === "ACTIVATE"
-                            ? `Device ${device.deviceName} activated`
-                            : `Device ${device.deviceName} updated`,
+        const { deviceName, deviceType, status } = body;
 
-                oldValues,
-                newValues,
+        if (
+            deviceName !== undefined &&
+            (
+                typeof deviceName !== "string" ||
+                !deviceName.trim() ||
+                deviceName.trim().length > 100
+            )
+        ) {
+            return errorResponse(
+                "deviceName must contain 1–100 characters",
+                400
+            );
+        }
+
+        if (
+            deviceType !== undefined &&
+            (
+                typeof deviceType !== "string" ||
+                !ALLOWED_DEVICE_TYPES.includes(
+                    deviceType as (typeof ALLOWED_DEVICE_TYPES)[number]
+                )
+            )
+        ) {
+            return errorResponse("Invalid deviceType", 400);
+        }
+
+        if (
+            status !== undefined &&
+            status !== "active" &&
+            status !== "inactive"
+        ) {
+            return errorResponse("Invalid device status", 400);
+        }
+
+        session = await mongoose.startSession();
+
+        let result:
+            | {
+                device: unknown;
+                auditLog: unknown;
             }
-        );
+            | undefined;
+
+        await session.withTransaction(async () => {
+            // Always scope the lookup to the authenticated tenant.
+            const device = await Device.findOne({
+                _id: id,
+                tenantId: context.tenantId,
+            }).session(session!);
+
+            if (!device) {
+                throw new DeviceNotFoundError();
+            }
+
+            const oldValues = {
+                deviceName: device.deviceName,
+                deviceType: device.deviceType,
+                status: device.status,
+            };
+
+            if (deviceName !== undefined) {
+                device.deviceName = deviceName.trim();
+            }
+
+            if (deviceType !== undefined) {
+                device.deviceType = deviceType as
+                    (typeof ALLOWED_DEVICE_TYPES)[number];
+            }
+
+            if (status !== undefined) {
+                device.status = status;
+            }
+
+            await device.save({ session });
+
+            const newValues = {
+                deviceName: device.deviceName,
+                deviceType: device.deviceType,
+                status: device.status,
+            };
+
+            let action = "UPDATE";
+
+            if (
+                oldValues.status === "active" &&
+                newValues.status === "inactive"
+            ) {
+                action = "DEACTIVATE";
+            } else if (
+                oldValues.status === "inactive" &&
+                newValues.status === "active"
+            ) {
+                action = "ACTIVATE";
+            }
+
+            const auditLog =
+                await AuditLogService.createAuditLog(
+                    {
+                        userId: new mongoose.Types.ObjectId(
+                            context.userId
+                        ),
+                        tenantId: new mongoose.Types.ObjectId(
+                            context.tenantId
+                        ),
+                    },
+                    {
+                        action,
+                        entity: "Device",
+                        entityId: device._id,
+                        description:
+                            action === "DEACTIVATE"
+                                ? `Device ${device.deviceName} deactivated`
+                                : action === "ACTIVATE"
+                                    ? `Device ${device.deviceName} activated`
+                                    : `Device ${device.deviceName} updated`,
+                        oldValues,
+                        newValues,
+                    },
+                    session
+                );
+
+            result = {
+                device: device.toObject(),
+                auditLog: auditLog.toObject(),
+            };
+        });
+
+        if (!result) {
+            throw new Error("Device update transaction returned no result");
+        }
 
         return NextResponse.json({
             success: true,
             message: "Device updated successfully",
-            device,
-            auditLog,
+            ...result,
         });
     } catch (error) {
+        if (error instanceof DeviceNotFoundError) {
+            return errorResponse("Device not found", 404);
+        }
+
         console.error("Device update error:", error);
 
-        return NextResponse.json(
-            {
-                success: false,
-                message: "Failed to update device",
-            },
-            { status: 500 }
-        );
+        if (error instanceof mongoose.Error.ValidationError) {
+            return errorResponse(error.message, 400);
+        }
+
+        return errorResponse("Failed to update device", 500);
+    } finally {
+        await session?.endSession();
     }
 }

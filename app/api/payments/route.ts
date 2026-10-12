@@ -1,38 +1,57 @@
-import { NextResponse } from "next/server";
+import { NextRequest, NextResponse } from "next/server";
 import mongoose from "mongoose";
 
-import { connectDB } from "@/lib/db/mongodb";
 import { PaymentService } from "@/lib/services/PaymentService";
+import { getAuthenticatedContext } from "@/lib/auth/getAuthenticatedContext";
 
-export async function POST(request: Request) {
+export async function POST(request: NextRequest) {
     try {
-        await connectDB();
+        const context = await getAuthenticatedContext(request);
 
-        const body = await request.json();
+        if (!context) {
+            return NextResponse.json(
+                {
+                    success: false,
+                    message:
+                        "Not authenticated or invalid authentication context",
+                },
+                { status: 401 }
+            );
+        }
 
-        // TEMPORARY TEST USER
         const user = {
             userId: new mongoose.Types.ObjectId(
-                "6abe4d3f6ae4b08a3e335463"
+                context.userId
             ),
+
             tenantId: new mongoose.Types.ObjectId(
-                "6abe48a86ae4b08a3e335303"
+                context.tenantId
             ),
         };
+
+        const body = await request.json();
 
         const result =
             await PaymentService.createPayment(
                 user,
-                body
+                body,
+                body.operationId
             );
 
         return NextResponse.json(
             {
                 success: true,
-                message: "Payment processed successfully",
+
+                message:
+                    result?.alreadyProcessed
+                        ? "Payment was already processed"
+                        : "Payment processed successfully",
+
                 result,
             },
-            { status: 201 }
+            {
+                status: 200,
+            }
         );
     } catch (error) {
         console.error(
@@ -43,12 +62,15 @@ export async function POST(request: Request) {
         return NextResponse.json(
             {
                 success: false,
+
                 message:
                     error instanceof Error
                         ? error.message
                         : "Failed to process payment",
             },
-            { status: 400 }
+            {
+                status: 400,
+            }
         );
     }
 }

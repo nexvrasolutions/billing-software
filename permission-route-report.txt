@@ -1,0 +1,69 @@
+﻿G:\Nexvra\billing-software\billing\app\api\audit-logs\route.ts:6: import { getAuthenticatedContext } from "@/lib/auth/getAuthenticatedContext";
+G:\Nexvra\billing-software\billing\app\api\audit-logs\route.ts:12: await getAuthenticatedContext(request);
+G:\Nexvra\billing-software\billing\app\api\audit-logs\route.ts:141: await getAuthenticatedContext(request);
+G:\Nexvra\billing-software\billing\app\api\audit-logs\[id]\route.ts:5: import { getAuthenticatedContext } from "@/lib/auth/getAuthenticatedContext";
+G:\Nexvra\billing-software\billing\app\api\audit-logs\[id]\route.ts:19: await getAuthenticatedContext(request);
+G:\Nexvra\billing-software\billing\app\api\auth\context-test\route.ts:2: import { getAuthenticatedContext } from "@/lib/auth/getAuthenticatedContext";
+G:\Nexvra\billing-software\billing\app\api\auth\context-test\route.ts:7: await getAuthenticatedContext(request);
+G:\Nexvra\billing-software\billing\app\api\auth\me\route.ts:6: import { getSession } from "@/lib/auth/getSession";
+G:\Nexvra\billing-software\billing\app\api\auth\me\route.ts:12: await getSession(request);
+G:\Nexvra\billing-software\billing\app\api\devices\route.ts:8: import { getAuthenticatedContext } from "@/lib/auth/getAuthenticatedContext";
+G:\Nexvra\billing-software\billing\app\api\devices\route.ts:9: import { hasPermission } from "@/lib/auth/hasPermission";
+G:\Nexvra\billing-software\billing\app\api\devices\route.ts:34: await getAuthenticatedContext(request);
+G:\Nexvra\billing-software\billing\app\api\devices\route.ts:40: const permitted = await hasPermission({
+G:\Nexvra\billing-software\billing\app\api\devices\route.ts:74: await getAuthenticatedContext(request);
+G:\Nexvra\billing-software\billing\app\api\devices\route.ts:80: const permitted = await hasPermission({
+G:\Nexvra\billing-software\billing\app\api\devices\[id]\route.ts:7: import { getAuthenticatedContext } from "@/lib/auth/getAuthenticatedContext";
+G:\Nexvra\billing-software\billing\app\api\devices\[id]\route.ts:8: import { hasPermission } from "@/lib/auth/hasPermission";
+G:\Nexvra\billing-software\billing\app\api\devices\[id]\route.ts:49: await getAuthenticatedContext(request);
+G:\Nexvra\billing-software\billing\app\api\devices\[id]\route.ts:55: const permitted = await hasPermission({
+G:\Nexvra\billing-software\billing\app\api\devices\[id]\route.ts:100: await getAuthenticatedContext(request);
+G:\Nexvra\billing-software\billing\app\api\devices\[id]\route.ts:106: const permitted = await hasPermission({
+G:\Nexvra\billing-software\billing\app\api\ledger-entries\route.ts:6: import { getAuthenticatedContext } from "@/lib/auth/getAuthenticatedContext";
+G:\Nexvra\billing-software\billing\app\api\ledger-entries\route.ts:11: await getAuthenticatedContext(request);
+G:\Nexvra\billing-software\billing\app\api\payments\route.ts:5: import { getAuthenticatedContext } from "@/lib/auth/getAuthenticatedContext";
+G:\Nexvra\billing-software\billing\app\api\payments\route.ts:9: const context = await getAuthenticatedContext(request);
+G:\Nexvra\billing-software\billing\app\api\products\route.ts:10: import { getAuthenticatedContext } from "@/lib/auth/getAuthenticatedContext";
+G:\Nexvra\billing-software\billing\app\api\products\route.ts:11: import { hasPermission } from "@/lib/auth/hasPermission";
+G:\Nexvra\billing-software\billing\app\api\products\route.ts:36: const auth = await getAuthenticatedContext(request);
+G:\Nexvra\billing-software\billing\app\api\products\route.ts:48: const canReadProducts = await hasPermission({
+G:\Nexvra\billing-software\billing\app\api\products\route.ts:94: const auth = await getAuthenticatedContext(request);
+G:\Nexvra\billing-software\billing\app\api\products\route.ts:106: const allowed = await hasPermission({
+G:\Nexvra\billing-software\billing\app\api\products\[id]\route.ts:8: import { getAuthenticatedContext } from "@/lib/auth/getAuthenticatedContext";
+G:\Nexvra\billing-software\billing\app\api\products\[id]\route.ts:9: import { hasPermission } from "@/lib/auth/hasPermission";
+G:\Nexvra\billing-software\billing\app\api\products\[id]\route.ts:34: const auth = await getAuthenticatedContext(request);
+G:\Nexvra\billing-software\billing\app\api\products\[id]\route.ts:47: const canReadProducts = await hasPermission({
+G:\Nexvra\billing-software\billing\app\api\products\[id]\route.ts:117: const auth = await getAuthenticatedContext(request);
+G:\Nexvra\billing-software\billing\app\api\products\[id]\route.ts:130: const allowed = await hasPermission({
+G:\Nexvra\billing-software\billing\app\api\products\[id]\route.ts:369: const auth = await getAuthenticatedContext(request);
+G:\Nexvra\billing-software\billing\app\api\products\[id]\route.ts:382: const allowed = await hasPermission({
+G:\Nexvra\billing-software\billing\app\api\purchase-returns\route.ts:5: import { getAuthenticatedContext } from "@/lib/auth/getAuthenticatedContext";
+G:\Nexvra\billing-software\billing\app\api\purchase-returns\route.ts:13: await getAuthenticatedContext(request);
+G:\Nexvra\billing-software\billing\app\api\purchases\route.ts:5: import { getAuthenticatedContext } from "@/lib/auth/getAuthenticatedContext";
+G:\Nexvra\billing-software\billing\app\api\purchases\route.ts:13: await getAuthenticatedContext(request);
+G:\Nexvra\billing-software\billing\app\api\sales\route.ts:5: import { getAuthenticatedContext } from "@/lib/auth/getAuthenticatedContext";
+G:\Nexvra\billing-software\billing\app\api\sales\route.ts:13: await getAuthenticatedContext(request);
+G:\Nexvra\billing-software\billing\app\api\sales-returns\route.ts:5: import { getAuthenticatedContext } from "@/lib/auth/getAuthenticatedContext";
+G:\Nexvra\billing-software\billing\app\api\sales-returns\route.ts:13: await getAuthenticatedContext(request);
+G:\Nexvra\billing-software\billing\app\api\stock-adjustments\route.ts:5: import { getAuthenticatedContext } from "@/lib/auth/getAuthenticatedContext";
+G:\Nexvra\billing-software\billing\app\api\stock-adjustments\route.ts:16: await getAuthenticatedContext(request);
+G:\Nexvra\billing-software\billing\app\api\sync-operations\route.ts:6: import { getAuthenticatedContext } from "@/lib/auth/getAuthenticatedContext";
+G:\Nexvra\billing-software\billing\app\api\sync-operations\route.ts:11: await getAuthenticatedContext(request);
+G:\Nexvra\billing-software\billing\app\api\sync-operations\process\route.ts:6: import { getAuthenticatedContext } from "@/lib/auth/getAuthenticatedContext";
+G:\Nexvra\billing-software\billing\app\api\sync-operations\process\route.ts:11: await getAuthenticatedContext(request);
+G:\Nexvra\billing-software\billing\app\api\taxes\route.ts:4: import { getAuthenticatedContext } from "@/lib/auth/getAuthenticatedContext";
+G:\Nexvra\billing-software\billing\app\api\taxes\route.ts:11: await getAuthenticatedContext(request);
+G:\Nexvra\billing-software\billing\app\api\taxes\[id]\route.ts:5: import { getAuthenticatedContext } from "@/lib/auth/getAuthenticatedContext";
+G:\Nexvra\billing-software\billing\app\api\taxes\[id]\route.ts:13: await getAuthenticatedContext(request);
+G:\Nexvra\billing-software\billing\app\api\users\route.ts:9: import { getAuthenticatedContext } from "@/lib/auth/getAuthenticatedContext";
+G:\Nexvra\billing-software\billing\app\api\users\route.ts:10: import { hasPermission } from "@/lib/auth/hasPermission";
+G:\Nexvra\billing-software\billing\app\api\users\route.ts:44: const context = await getAuthenticatedContext(request);
+G:\Nexvra\billing-software\billing\app\api\users\route.ts:55: const allowed = await hasPermission({
+G:\Nexvra\billing-software\billing\app\api\users\route.ts:124: const context = await getAuthenticatedContext(request);
+G:\Nexvra\billing-software\billing\app\api\users\route.ts:135: const allowed = await hasPermission({
+G:\Nexvra\billing-software\billing\app\api\users\[id]\route.ts:11: import { getAuthenticatedContext } from "@/lib/auth/getAuthenticatedContext";
+G:\Nexvra\billing-software\billing\app\api\users\[id]\route.ts:12: import { hasPermission } from "@/lib/auth/hasPermission";
+G:\Nexvra\billing-software\billing\app\api\users\[id]\route.ts:46: const auth = await getAuthenticatedContext(request);
+G:\Nexvra\billing-software\billing\app\api\users\[id]\route.ts:52: const allowed = await hasPermission({
+G:\Nexvra\billing-software\billing\app\api\users\[id]\route.ts:98: const auth = await getAuthenticatedContext(request);
+G:\Nexvra\billing-software\billing\app\api\users\[id]\route.ts:104: const allowed = await hasPermission({

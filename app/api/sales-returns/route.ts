@@ -1,26 +1,42 @@
-
-import { NextResponse } from "next/server";
+import { NextRequest, NextResponse } from "next/server";
 import mongoose from "mongoose";
 
-import { connectDB } from "@/lib/db/mongodb";
 import { SalesReturnService } from "@/lib/services/SalesReturnService";
+import { getAuthenticatedContext } from "@/lib/auth/getAuthenticatedContext";
 
-export async function POST(request: Request) {
+export async function POST(
+    request: NextRequest
+) {
     try {
-        await connectDB();
+        // 1. Get authenticated user/tenant/device context
+        const context =
+            await getAuthenticatedContext(request);
 
-        const body = await request.json();
+        if (!context) {
+            return NextResponse.json(
+                {
+                    success: false,
+                    message:
+                        "Not authenticated or invalid authentication context",
+                },
+                { status: 401 }
+            );
+        }
 
-        // TEMPORARY TEST USER
+        // 2. Convert trusted session IDs to MongoDB ObjectIds
         const user = {
             userId: new mongoose.Types.ObjectId(
-                "6abe4d3f6ae4b08a3e335463"
+                context.userId
             ),
             tenantId: new mongoose.Types.ObjectId(
-                "6abe48a86ae4b08a3e335303"
+                context.tenantId
             ),
         };
 
+        // 3. Read request body
+        const body = await request.json();
+
+        // 4. Create sales return using authenticated tenant
         const salesReturn =
             await SalesReturnService.createSalesReturn(
                 user,

@@ -1,33 +1,80 @@
-import { NextResponse } from "next/server";
+import { NextRequest, NextResponse } from "next/server";
 import mongoose from "mongoose";
 
-import { connectDB } from "@/lib/db/mongodb";
 import { StockService } from "@/lib/services/StockService";
+import { getAuthenticatedContext } from "@/lib/auth/getAuthenticatedContext";
 
-const TEST_TENANT_ID = "6abe48a86ae4b08a3e335303";
-const TEST_USER_ID = "6abe4d3f6ae4b08a3e335463";
-
-export async function POST(request: Request) {
+export async function POST(
+    request: NextRequest
+) {
     try {
-        await connectDB();
+        // --------------------------------------------------
+        // 1. Get authenticated user/tenant context
+        // --------------------------------------------------
 
-        const body = await request.json();
+        const context =
+            await getAuthenticatedContext(request);
 
-        // Validate product ID
+        if (!context) {
+            return NextResponse.json(
+                {
+                    success: false,
+                    message:
+                        "Not authenticated or invalid authentication context",
+                },
+                { status: 401 }
+            );
+        }
+
+        const body =
+            await request.json();
+
+        // --------------------------------------------------
+        // 2. Validate operationId
+        // --------------------------------------------------
+
         if (
-            !body.productId ||
-            !mongoose.isValidObjectId(body.productId)
+            !body.operationId ||
+            typeof body.operationId !== "string" ||
+            !body.operationId.trim()
         ) {
             return NextResponse.json(
                 {
                     success: false,
-                    message: "Valid productId is required",
+                    message:
+                        "operationId is required",
                 },
                 { status: 400 }
             );
         }
 
-        // Validate quantity
+        const operationId =
+            body.operationId.trim();
+
+        // --------------------------------------------------
+        // 3. Validate product ID
+        // --------------------------------------------------
+
+        if (
+            !body.productId ||
+            !mongoose.isValidObjectId(
+                body.productId
+            )
+        ) {
+            return NextResponse.json(
+                {
+                    success: false,
+                    message:
+                        "Valid productId is required",
+                },
+                { status: 400 }
+            );
+        }
+
+        // --------------------------------------------------
+        // 4. Validate quantity
+        // --------------------------------------------------
+
         if (
             typeof body.quantity !== "number" ||
             !Number.isFinite(body.quantity) ||
@@ -43,61 +90,117 @@ export async function POST(request: Request) {
             );
         }
 
-        // Validate warehouse
-        if (!body.warehouse?.name?.trim()) {
+        // --------------------------------------------------
+        // 5. Validate warehouse
+        // --------------------------------------------------
+
+        if (
+            !body.warehouse?.name?.trim()
+        ) {
             return NextResponse.json(
                 {
                     success: false,
-                    message: "Warehouse name is required",
+                    message:
+                        "Warehouse name is required",
                 },
                 { status: 400 }
             );
         }
 
-        // Validate reason
-        if (!body.reason?.trim()) {
+        // --------------------------------------------------
+        // 6. Validate reason
+        // --------------------------------------------------
+
+        if (
+            !body.reason?.trim()
+        ) {
             return NextResponse.json(
                 {
                     success: false,
-                    message: "Reason is required for stock adjustment",
+                    message:
+                        "Reason is required for stock adjustment",
                 },
                 { status: 400 }
             );
         }
+
+        // --------------------------------------------------
+        // 7. Use authenticated user context
+        // --------------------------------------------------
 
         const user = {
-            userId: new mongoose.Types.ObjectId(TEST_USER_ID),
-            tenantId: new mongoose.Types.ObjectId(TEST_TENANT_ID),
+            userId:
+                new mongoose.Types.ObjectId(
+                    context.userId
+                ),
+
+            tenantId:
+                new mongoose.Types.ObjectId(
+                    context.tenantId
+                ),
         };
 
-        const result = await StockService.changeStock(
-            user,
-            {
-                productId: body.productId,
-                quantity: body.quantity,
-                type: "adjustment",
-                warehouse: {
-                    name: body.warehouse.name,
-                    location: body.warehouse.location,
+        // --------------------------------------------------
+        // 8. Process stock adjustment
+        // --------------------------------------------------
+
+        const result =
+            await StockService.changeStock(
+                user,
+                {
+                    productId:
+                        body.productId,
+
+                    quantity:
+                        body.quantity,
+
+                    type:
+                        "adjustment",
+
+                    warehouse: {
+                        name:
+                            body.warehouse.name,
+
+                        location:
+                            body.warehouse.location,
+                    },
+
+                    reason:
+                        body.reason,
                 },
-                reason: body.reason,
-            }
-        );
+
+                undefined,
+
+                operationId
+            );
+
+        // --------------------------------------------------
+        // 9. Response
+        // --------------------------------------------------
 
         return NextResponse.json(
             {
                 success: true,
-                message: "Stock adjustment completed successfully",
+
+                message:
+                    result.alreadyProcessed
+                        ? "Stock adjustment was already processed"
+                        : "Stock adjustment completed successfully",
+
                 result,
             },
             { status: 200 }
         );
     } catch (error) {
-        console.error("Stock adjustment error:", error);
+        console.error(
+            "Stock adjustment error:",
+            error
+        );
 
         return NextResponse.json(
             {
                 success: false,
+
                 message:
                     error instanceof Error
                         ? error.message

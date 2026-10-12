@@ -1,20 +1,54 @@
 import dns from "dns";
 import mongoose from "mongoose";
 
-// Use public DNS resolvers to avoid local DNS/SRV resolution problems
+/*
+ * DNS servers used to resolve "mongodb+srv://" connection strings.
+ *
+ * Some networks' default resolver cannot answer the SRV/TXT lookups that
+ * mongodb+srv needs, so public resolvers are used by default.
+ * MONGODB_DNS_SERVERS overrides this:
+ *   - "system"                 -> use the machine's normal DNS (no override)
+ *   - "8.8.8.8,1.1.1.1"        -> use these servers
+ *   - unset                    -> the public defaults below
+ */
+const DEFAULT_DNS_SERVERS = ["8.8.8.8", "1.1.1.1", "8.8.4.4"];
+
 function setupDns() {
+    // Apply only once per process: Node must not change DNS servers while
+    // lookups are in flight (the driver keeps polling SRV records).
+    // The flag lives on globalThis because the production build bundles
+    // this module separately into each route.
+    if (global._mongoDnsConfigured) {
+        return;
+    }
+
+    global._mongoDnsConfigured = true;
+
+    const setting = process.env.MONGODB_DNS_SERVERS?.trim();
+
+    if (setting?.toLowerCase() === "system") {
+        return;
+    }
+
+    const servers = setting
+        ? setting.split(",").map((server) => server.trim()).filter(Boolean)
+        : DEFAULT_DNS_SERVERS;
+
     try {
-        dns.setServers([
-            "8.8.8.8",
-            "1.1.1.1",
-            "8.8.4.4",
-        ]);
-    } catch {
-        // Ignore DNS setup errors
+        // The MongoDB driver resolves SRV/TXT through dns.promises. In the
+        // Next.js server, dns.setServers() alone did not reach that resolver
+        // for the first lookup, so set the promise API explicitly too.
+        dns.setServers(servers);
+        dns.promises.setServers(servers);
+    } catch (error) {
+        // Not fatal: the system resolver is used. Report it instead of
+        // failing silently (no secrets: only the error code).
+        console.error(
+            "MongoDB DNS server setup failed; using system DNS:",
+            (error as { code?: unknown })?.code ?? "unknown"
+        );
     }
 }
-
-setupDns();
 
 interface MongooseCache {
     uri: string;
@@ -23,8 +57,8 @@ interface MongooseCache {
 }
 
 declare global {
-    // eslint-disable-next-line no-var
     var _mongooseCache: MongooseCache | undefined;
+    var _mongoDnsConfigured: boolean | undefined;
 }
 
 export async function connectDB(): Promise<typeof mongoose> {
@@ -81,10 +115,17 @@ export async function connectDB(): Promise<typeof mongoose> {
         });
     }
 
+    const attempt = cached.promise;
+
     try {
-        cached.conn = await cached.promise;
+        cached.conn = await attempt;
     } catch (error) {
-        cached.promise = null;
+        // Allow a later call to retry, but only clear THIS failed attempt:
+        // a newer attempt started by another request must not be dropped.
+        if (cached.promise === attempt) {
+            cached.promise = null;
+        }
+
         throw error;
     }
 
