@@ -15,6 +15,7 @@
 import { loadEnvConfig } from "@next/env";
 
 import { runTestSafely } from "./lib/testRunSafety";
+import { ensureTestPermissions } from "./lib/testPermissions";
 
 loadEnvConfig(process.cwd(), false, { info() {}, error() {} });
 
@@ -49,6 +50,8 @@ async function main() {
     const { Tenant } = await import("../lib/models/Tenant");
     const { User } = await import("../lib/models/User");
     const { Device } = await import("../lib/models/Device");
+    const { Role } = await import("../lib/models/Role");
+    const { Permission } = await import("../lib/models/Permission");
     const { Category } = await import("../lib/models/Category");
     const { Unit } = await import("../lib/models/Unit");
     const { Product } = await import("../lib/models/Product");
@@ -173,10 +176,19 @@ async function main() {
             const tenantB = run.newTenantId();
             await Tenant.create({ _id: tenantB, name: run.tenantName("B"), status: "active" });
 
+            // Processing a queued sale requires sales.create (role at processing time).
+            const salesCreateId = (await ensureTestPermissions(run, Permission, ["sales.create"])).get("sales.create")!;
+            const sellerRoles = new Map<string, ObjectId>();
+            for (const tenantId of [tenantA, tenantB]) {
+                const role = await Role.create({ tenantId, name: `Seller ${suffix}`, permissions: [salesCreateId], status: "active" });
+                sellerRoles.set(tenantId.toString(), role._id as ObjectId);
+            }
+
             async function makeUser(tenantId: ObjectId, label: string) {
                 const user = await User.create({
                     tenantId, name: `Sync ${label}`, email: `sync-${label}-${suffix}@example.invalid`,
                     passwordHash: "NOT_A_REAL_HASH_TEST_ONLY", status: "active",
+                    roleId: sellerRoles.get(tenantId.toString()),
                 });
                 const device = await Device.create({
                     tenantId, userId: user._id, deviceName: `sync ${label}`, deviceType: "pos",

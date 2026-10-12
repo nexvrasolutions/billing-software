@@ -6,10 +6,84 @@ import { Customer } from "@/lib/models/Customer";
 import { Unit } from "@/lib/models/Unit";
 import { StockService } from "@/lib/services/StockService";
 import { LedgerService } from "@/lib/services/LedgerService";
+import { AuditLogService } from "@/lib/services/AuditLogService";
+import {
+    BusinessPermissionError,
+    SALE_DATE_RULES,
+} from "@/lib/auth/businessPermissions";
 
 export interface SalesUserContext {
     userId: mongoose.Types.ObjectId;
     tenantId: mongoose.Types.ObjectId;
+    // Device of the authenticated session (recorded in the audit log).
+    deviceId?: mongoose.Types.ObjectId;
+}
+
+/**
+ * What the caller is allowed to do beyond a plain sale. Computed from the
+ * user's CURRENT permissions by the caller (route or sync processing).
+ * When omitted, the strictest policy applies.
+ */
+export interface SalePolicy {
+    // sales.priceOverride: a price other than the selling price, or a discount.
+    allowPriceOverride: boolean;
+    // sales.backdate: a sale date older than referenceTime - maxAgeMs.
+    allowBackdate: boolean;
+    // Online: now. Offline sync: when the server first received the operation.
+    referenceTime: Date;
+    maxAgeMs: number;
+}
+
+function strictSalePolicy(): SalePolicy {
+    return {
+        allowPriceOverride: false,
+        allowBackdate: false,
+        referenceTime: new Date(),
+        maxAgeMs: SALE_DATE_RULES.onlineMaxAgeMs,
+    };
+}
+
+/** Sale date after the date rules; throws when the date is not allowed. */
+function resolveSaleDate(
+    value: unknown,
+    policy: SalePolicy,
+    now: Date
+): { saleDate: Date; backdated: boolean } {
+    if (value === undefined || value === null || value === "") {
+        return { saleDate: now, backdated: false };
+    }
+
+    const saleDate =
+        value instanceof Date || typeof value === "string"
+            ? new Date(value)
+            : new Date(Number.NaN);
+
+    if (!Number.isFinite(saleDate.getTime())) {
+        throw new Error("Invalid sale date");
+    }
+
+    // Never in the future (beyond a small clock difference), whatever the
+    // user's permissions.
+    if (saleDate.getTime() > now.getTime() + SALE_DATE_RULES.maxFutureMs) {
+        throw new Error("Sale date cannot be in the future");
+    }
+
+    const oldestAllowed = policy.referenceTime.getTime() - policy.maxAgeMs;
+    const backdated = saleDate.getTime() < oldestAllowed;
+
+    if (backdated && !policy.allowBackdate) {
+        throw new BusinessPermissionError(
+            "This sale date is too far in the past; it requires the sales.backdate permission"
+        );
+    }
+
+    return { saleDate, backdated };
+}
+
+/** True for a duplicate-key error on the tenant's invoice-number index. */
+function isDuplicateInvoiceError(error: unknown): boolean {
+    const mongoError = error as { code?: unknown; keyPattern?: Record<string, unknown> } | null;
+    return mongoError?.code === 11000 && Boolean(mongoError.keyPattern?.invoiceNo);
 }
 
 export interface SaleItemInput {
@@ -54,10 +128,18 @@ export class SalesService {
     static async createSale(
         user: SalesUserContext,
         input: CreateSaleInput,
-        operationId?: string
+        operationId?: string,
+        policy: SalePolicy = strictSalePolicy()
     ) {
         const session =
             await mongoose.startSession();
+
+        // Invoice numbers are stored upper-case and trimmed (schema), and
+        // are unique per tenant (database index tenantId + invoiceNo).
+        const invoiceNo =
+            typeof input.invoiceNo === "string"
+                ? input.invoiceNo.trim().toUpperCase()
+                : "";
 
         /*
          * operationId is supplied by SyncService when the sale
@@ -93,7 +175,7 @@ export class SalesService {
                     // 2. Validate invoice number
                     // ----------------------------------------------------
 
-                    if (!input.invoiceNo?.trim()) {
+                    if (!invoiceNo) {
                         throw new Error(
                             "Invoice number is required"
                         );
@@ -149,19 +231,32 @@ export class SalesService {
                     }
 
                     // ----------------------------------------------------
+                    // 5b. Sale date rules (future dates, backdating)
+                    // ----------------------------------------------------
+
+                    const { saleDate, backdated } =
+                        resolveSaleDate(
+                            input.saleDate,
+                            policy,
+                            new Date()
+                        );
+
+                    // ----------------------------------------------------
                     // 6. Check duplicate invoice
                     // ----------------------------------------------------
+                    //
+                    // The unique index (tenantId + invoiceNo) also rejects
+                    // a concurrent duplicate; see the catch block below.
 
                     const existingInvoice =
                         await Sale.findOne({
                             tenantId: user.tenantId,
-                            invoiceNo:
-                                input.invoiceNo.trim(),
+                            invoiceNo,
                         }).session(session);
 
                     if (existingInvoice) {
                         throw new Error(
-                            `Invoice ${input.invoiceNo} already exists`
+                            `Invoice ${invoiceNo} already exists`
                         );
                     }
 
@@ -206,6 +301,7 @@ export class SalesService {
                     let subtotal = 0;
                     let discountTotal = 0;
                     let taxTotal = 0;
+                    let priceOverridden = false;
 
                     // ----------------------------------------------------
                     // 9. Process each product
@@ -318,6 +414,25 @@ export class SalesService {
                                 `Invalid discount rate for ${product.name}`
                             );
                         }
+
+                        // ------------------------------------------------
+                        // Price override / discount permission
+                        // ------------------------------------------------
+
+                        const lineOverridesPrice =
+                            Math.abs(unitPrice - product.sellingPrice) > 1e-9 ||
+                            discountRate > 0;
+
+                        if (
+                            lineOverridesPrice &&
+                            !policy.allowPriceOverride
+                        ) {
+                            throw new BusinessPermissionError(
+                                `Changing the price of ${product.name} or giving a discount requires the sales.priceOverride permission`
+                            );
+                        }
+
+                        priceOverridden ||= lineOverridesPrice;
 
                         // ------------------------------------------------
                         // Calculate gross amount
@@ -530,8 +645,7 @@ export class SalesService {
                         operationId:
                             normalizedOperationId,
 
-                        invoiceNo:
-                            input.invoiceNo.trim(),
+                        invoiceNo,
 
                         customerId:
                             customer?._id,
@@ -550,9 +664,7 @@ export class SalesService {
                                 }
                                 : undefined,
 
-                        saleDate:
-                            input.saleDate ??
-                            new Date(),
+                        saleDate,
 
                         warehouse: {
                             name:
@@ -704,6 +816,38 @@ export class SalesService {
                     );
 
                     // ----------------------------------------------------
+                    // 18b. Audit log (same transaction: if it fails, the
+                    //      sale, stock and ledger changes roll back)
+                    // ----------------------------------------------------
+
+                    await AuditLogService.createAuditLog(
+                        {
+                            userId: user.userId,
+                            tenantId: user.tenantId,
+                            deviceId: user.deviceId,
+                        },
+                        {
+                            action: "CREATE",
+                            entity: "Sale",
+                            entityId: sale._id,
+                            description:
+                                `Sale ${sale.invoiceNo} created`,
+                            newValues: {
+                                invoiceNo: sale.invoiceNo,
+                                saleDate: sale.saleDate,
+                                grandTotal: sale.grandTotal,
+                                paidAmount: sale.paidAmount,
+                                paymentStatus: sale.paymentStatus,
+                                itemCount: saleItems.length,
+                                operationId: sale.operationId,
+                                priceOverridden,
+                                backdated,
+                            },
+                        },
+                        session
+                    );
+
+                    // ----------------------------------------------------
                     // 19. Store created sale
                     // ----------------------------------------------------
 
@@ -761,6 +905,13 @@ export class SalesService {
                 ) {
                     return existingOperationSale;
                 }
+            }
+
+            // A concurrent sale took this invoice number first.
+            if (isDuplicateInvoiceError(error)) {
+                throw new Error(
+                    `Invoice ${invoiceNo} already exists`
+                );
             }
 
             throw error;

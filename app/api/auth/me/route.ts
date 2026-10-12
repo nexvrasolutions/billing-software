@@ -4,6 +4,8 @@ import { User } from "@/lib/models/User";
 import { Tenant } from "@/lib/models/Tenant";
 import { Device } from "@/lib/models/Device";
 import { getSession } from "@/lib/auth/getSession";
+import { getGrantedPermissions } from "@/lib/auth/hasPermission";
+import { Permission } from "@/lib/models/Permission";
 
 export async function GET(request: NextRequest) {
     try {
@@ -84,10 +86,28 @@ export async function GET(request: NextRequest) {
             }
         );
 
-        // 6. Return authenticated context
+        // 6. The user's CURRENT permission names (from the database role).
+        //    For display and offline convenience checks in the browser only:
+        //    every server route checks permissions itself. None while a
+        //    temporary password must be changed.
+        let permissions: string[] = [];
+
+        if (user.mustChangePassword !== true && user.roleId) {
+            const catalogue = await Permission.find({}).select("name").lean();
+            const granted = await getGrantedPermissions({
+                userId: user._id.toString(),
+                tenantId: user.tenantId.toString(),
+                roleId: user.roleId.toString(),
+                permissions: catalogue.map((p) => p.name),
+            });
+            permissions = [...granted].sort();
+        }
+
+        // 7. Return authenticated context
         return NextResponse.json({
             success: true,
             authenticated: true,
+            permissions,
             user: {
                 id: user._id.toString(),
                 name: user.name,

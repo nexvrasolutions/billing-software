@@ -4,6 +4,10 @@ import mongoose from "mongoose";
 import { connectDB } from "@/lib/db/mongodb";
 import { LedgerService } from "@/lib/services/LedgerService";
 import { getAuthenticatedContext } from "@/lib/auth/getAuthenticatedContext";
+import {
+    BUSINESS_PERMISSIONS,
+    requireBusinessPermission,
+} from "@/lib/auth/businessPermissions";
 
 export async function POST(request: NextRequest) {
     try {
@@ -22,6 +26,16 @@ export async function POST(request: NextRequest) {
         }
 
         await connectDB();
+
+        // Manual ledger entries: permission from the user's current role.
+        const denied = await requireBusinessPermission(
+            authContext,
+            BUSINESS_PERMISSIONS.ledgerCreate
+        );
+
+        if (denied) {
+            return denied;
+        }
 
         const body = await request.json();
 

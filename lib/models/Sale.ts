@@ -349,6 +349,20 @@ const SaleSchema = new Schema<ISale>(
 ========================= */
 
 // Each invoice number must be unique inside a tenant.
+// Matches the existing database index "tenantId_1_invoiceNo_1" exactly.
+SaleSchema.index(
+    {
+        tenantId: 1,
+        invoiceNo: 1,
+    },
+    {
+        unique: true,
+    }
+);
+
+// Each offline operation can be processed only once inside a tenant.
+// The partial filter allows online sales without an operationId.
+// Matches the existing database index "tenantId_1_operationId_1" exactly.
 SaleSchema.index(
     {
         tenantId: 1,
@@ -361,22 +375,6 @@ SaleSchema.index(
                 $exists: true,
             },
         },
-    }
-);
-
-// Each offline operation can be processed only once
-// inside a tenant.
-//
-// sparse: true allows existing/online sales that do not
-// have an operationId.
-SaleSchema.index(
-    {
-        tenantId: 1,
-        operationId: 1,
-    },
-    {
-        unique: true,
-        sparse: true,
     }
 );
 

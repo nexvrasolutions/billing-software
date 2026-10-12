@@ -103,10 +103,13 @@ async function runSync(holdsExclusiveLock: boolean): Promise<SyncRunResult> {
     try {
         identity = await fetchSessionIdentity();
     } catch {
-        return { ran: false, reason: "offline", results: [] };
+        // Network or server error: says nothing about the session.
+        return { ran: false, reason: "server unreachable", results: [] };
     }
 
     if (!identity) {
+        // The server rejected the session; the remembered identity was
+        // forgotten by fetchSessionIdentity. Queued items are kept.
         return { ran: false, reason: "not signed in", results: [] };
     }
 

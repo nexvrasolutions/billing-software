@@ -33,13 +33,18 @@ const TENANT_SCOPED_COLLECTIONS = [
     "syncoperations",
     "tenantadminguards",
     "sales",
+    "salesreturns",
+    "purchases",
+    "purchasereturns",
     "stockmovements",
     "ledgerentries",
     "payments",
     "customers",
+    "suppliers",
     "products",
     "units",
     "categories",
+    "taxes",
 ] as const;
 
 const SETTLE_DELAY_MS = 3000;
@@ -60,6 +65,13 @@ export interface TestRun {
     addRateLimitKeys(keys: string[]): void;
     /** Register non-database cleanup (e.g. killing a browser). */
     onCleanup(label: string, fn: () => void | Promise<void>): void;
+    /**
+     * Generate and register the _id of a shared Permission record BEFORE
+     * inserting it. Cleanup deletes only registered IDs, only while the
+     * record still has this name, and never while a role outside this run
+     * uses it. Pre-existing permissions are never registered or deleted.
+     */
+    newSharedPermissionId(name: string): Types.ObjectId;
     /** True once the overall timeout fired; steps should stop. */
     readonly aborted: boolean;
 }
@@ -80,6 +92,7 @@ class RunState implements TestRun {
     readonly tenantIds: Types.ObjectId[] = [];
     readonly rateLimitKeys = new Set<string>();
     readonly cleanups: { label: string; fn: () => void | Promise<void> }[] = [];
+    readonly sharedPermissions: { id: Types.ObjectId; name: string }[] = [];
     aborted = false;
 
     constructor(private readonly prefix: string) {}
@@ -102,6 +115,12 @@ class RunState implements TestRun {
         this.cleanups.push({ label, fn });
     }
 
+    newSharedPermissionId(name: string) {
+        const id = new Types.ObjectId();
+        this.sharedPermissions.push({ id, name });
+        return id;
+    }
+
     isThisRunsTenantName(name: unknown) {
         return typeof name === "string" && name.startsWith(this.prefix) && name.endsWith(`-${this.runId}`);
     }
@@ -121,7 +140,7 @@ async function countRemaining(db: mongoose.mongo.Db, state: RunState) {
 async function cleanupRecords(state: RunState): Promise<string[]> {
     const problems: string[] = [];
 
-    if (!state.tenantIds.length && !state.rateLimitKeys.size) {
+    if (!state.tenantIds.length && !state.rateLimitKeys.size && !state.sharedPermissions.length) {
         return problems;
     }
 
@@ -193,6 +212,30 @@ async function cleanupRecords(state: RunState): Promise<string[]> {
         const leftovers = Object.entries(remaining).filter(([, count]) => count > 0);
         if (leftovers.length && !refused.length) {
             problems.push(`records remain after cleanup: ${leftovers.map(([c, n]) => `${c}=${n}`).join(", ")}`);
+        }
+
+        // Shared permission records this run created (after this run's roles
+        // are gone). Only registered IDs; never a pre-existing record.
+        for (const { id, name } of state.sharedPermissions) {
+            try {
+                const record = await db.collection("permissions").findOne({ _id: id }, { projection: { name: 1 } });
+                if (!record) continue; // never inserted (e.g. it already existed)
+                if (record.name !== name) {
+                    problems.push(`REFUSED to delete permission ${id}: its name is no longer "${name}"`);
+                    continue;
+                }
+                const usedBy = await db.collection("roles").countDocuments({ permissions: id });
+                if (usedBy > 0) {
+                    problems.push(`kept test-created permission "${name}" (${id}): ${usedBy} role(s) outside this run now use it; review manually`);
+                    continue;
+                }
+                const result = await db.collection("permissions").deleteOne({ _id: id, name });
+                if (result.deletedCount !== 1) {
+                    problems.push(`test-created permission "${name}" (${id}) could not be deleted`);
+                }
+            } catch (error) {
+                problems.push(`cleanup of permission "${name}" failed: ${(error as Error).message}`);
+            }
         }
     } catch (error) {
         problems.push(`cleanup could not run: ${(error as Error).message}`);
@@ -281,7 +324,7 @@ export async function runTestSafely(options: Options): Promise<never> {
         cleanupProblems.forEach((problem) => console.error(`  - ${problem}`));
         console.error(`Manual cleanup needed for tenant IDs: ${state.tenantIds.join(", ") || "(none)"} (names ${options.tenantNamePrefix}*-${state.runId})`);
     } else {
-        console.log(`\nCleanup OK: ${state.tenantIds.length} test tenant(s) and their records, ${state.rateLimitKeys.size} rate-limit counter key(s); verified none remain.`);
+        console.log(`\nCleanup OK: ${state.tenantIds.length} test tenant(s) and their records, ${state.rateLimitKeys.size} rate-limit counter key(s), ${state.sharedPermissions.length} test-created permission record(s) considered; verified none remain.`);
     }
 
     // --- summary and exit ---------------------------------------------------

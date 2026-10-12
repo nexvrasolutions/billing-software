@@ -6,6 +6,10 @@ import { connectDB } from "@/lib/db/mongodb";
 import { SyncOperation } from "@/lib/models/SyncOperation";
 import { getAuthenticatedContext } from "@/lib/auth/getAuthenticatedContext";
 import { SyncProcessError } from "@/lib/services/SyncErrors";
+import {
+    getGrantedBusinessPermissions,
+    getSyncEntityPermission,
+} from "@/lib/auth/businessPermissions";
 
 const objectIdSchema = z.string().regex(/^[a-f\d]{24}$/i, "Invalid ID");
 
@@ -91,6 +95,36 @@ export async function POST(request: NextRequest) {
         }
 
         await connectDB();
+
+        // Operation types without an explicit permission mapping are never
+        // accepted (deny by default), whatever the user's role.
+        const requiredPermission = getSyncEntityPermission(input.entityType);
+
+        if (!requiredPermission) {
+            return errorJson(
+                new SyncProcessError(
+                    403,
+                    "PERMISSION_DENIED",
+                    "This type of operation cannot be synchronized",
+                    false
+                )
+            );
+        }
+
+        // The user must be allowed to perform this kind of operation. It is
+        // checked again (with the role at that time) when it is processed.
+        const granted = await getGrantedBusinessPermissions(authContext, [requiredPermission]);
+
+        if (!granted.has(requiredPermission)) {
+            return errorJson(
+                new SyncProcessError(
+                    403,
+                    "PERMISSION_DENIED",
+                    "You do not have permission to record this operation",
+                    false
+                )
+            );
+        }
 
         // Identity always comes from the authenticated session.
         const tenantId = new mongoose.Types.ObjectId(authContext.tenantId);

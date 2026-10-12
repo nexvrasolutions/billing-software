@@ -1,20 +1,38 @@
 "use client";
 
-import { FormEvent, useEffect, useState } from "react";
+import { FormEvent, useCallback, useEffect, useState } from "react";
 import Link from "next/link";
 
 import { Button } from "@/components/ui/button";
-import { forgetSessionIdentity } from "@/lib/offline/sessionIdentity";
+import {
+    confirmServerSession,
+    endOfflineAccess,
+    identityFromMe,
+    isSessionRejected,
+    rememberSessionIdentity,
+} from "@/lib/offline/sessionIdentity";
+import {
+    getOfflineStateFor,
+    removeOfflineAccess,
+    settlePendingServerLogout,
+    setUpOfflinePin,
+} from "@/lib/offline/offlineAccess";
+import {
+    OFFLINE_WORK_PERMISSION,
+    validatePin,
+    type OfflineSessionState,
+} from "@/lib/offline/offlineSession";
 
 /*
- * "My account": change password, log out, log out everywhere.
+ * "My account": change password, offline PIN, log out, log out everywhere.
  * All rules are enforced by the API; this page only reports results.
  */
 
 interface Me {
-    user: { name: string; email: string; mustChangePassword?: boolean };
+    user: { id: string; tenantId: string; name: string; email: string; mustChangePassword?: boolean };
     tenant: { name: string };
-    device: { deviceName: string };
+    device: { id: string; deviceName: string };
+    permissions?: string[];
 }
 
 type Notice = { kind: "success" | "error"; text: string } | null;
@@ -34,6 +52,143 @@ async function postJson(path: string, body?: unknown) {
     }
 }
 
+/**
+ * Offline PIN (online only). Before saving, the server session is checked
+ * live: same account and device, no temporary password pending, and the
+ * sales.create permission. The PIN never leaves this device.
+ */
+function OfflinePinSection({ me }: { me: Me }) {
+    const [state, setState] = useState<OfflineSessionState | null>(null);
+    const [pin, setPin] = useState("");
+    const [confirmPin, setConfirmPin] = useState("");
+    const [result, setResult] = useState<Notice>(null);
+    const [busy, setBusy] = useState(false);
+    const identity = identityFromMe(me);
+    const allowed = (me.permissions ?? []).includes(OFFLINE_WORK_PERMISSION);
+    const tenantId = me.user.tenantId;
+    const userId = me.user.id;
+    const deviceId = me.device.id;
+
+    const refresh = useCallback(() => {
+        const current = identityFromMe({ user: { tenantId, id: userId }, device: { id: deviceId } });
+        if (current) void getOfflineStateFor(current).then(setState).catch(() => undefined);
+    }, [tenantId, userId, deviceId]);
+
+    useEffect(() => {
+        refresh();
+    }, [refresh]);
+
+    async function save(event: FormEvent<HTMLFormElement>) {
+        event.preventDefault();
+        setResult(null);
+
+        const problem = validatePin(pin);
+        if (problem) {
+            setResult({ kind: "error", text: problem });
+            return;
+        }
+        if (pin !== confirmPin) {
+            setResult({ kind: "error", text: "The PINs do not match." });
+            return;
+        }
+
+        setBusy(true);
+        try {
+            // Live server check right before saving (never a cached answer).
+            const response = await fetch("/api/auth/me", { credentials: "include", cache: "no-store" });
+            const data = response.ok ? await response.json().catch(() => null) : null;
+            const live = identityFromMe(data);
+
+            if (
+                !data?.authenticated ||
+                data.user?.mustChangePassword === true ||
+                !live || !identity ||
+                live.tenantId !== identity.tenantId || live.userId !== identity.userId || live.deviceId !== identity.deviceId
+            ) {
+                setResult({ kind: "error", text: "Your session could not be confirmed. Sign in again and retry." });
+                return;
+            }
+            const permissions: string[] = Array.isArray(data.permissions) ? data.permissions : [];
+            if (!permissions.includes(OFFLINE_WORK_PERMISSION)) {
+                setResult({ kind: "error", text: "Your role is not allowed to record sales offline." });
+                return;
+            }
+
+            await rememberSessionIdentity(live);
+            const record = await setUpOfflinePin({ identity: live, pin, permissions, displayName: data.user?.name });
+            setResult({ kind: "success", text: `Offline PIN saved. Offline access is ready until ${new Date(record.expiresAt).toLocaleString()}.` });
+        } catch {
+            setResult({ kind: "error", text: "Unable to contact the server. The offline PIN can only be set while online." });
+        } finally {
+            setPin("");
+            setConfirmPin("");
+            setBusy(false);
+            refresh();
+        }
+    }
+
+    async function remove() {
+        if (!identity) return;
+        await removeOfflineAccess(identity).catch(() => undefined);
+        setResult({ kind: "success", text: "Offline access removed from this device. Queued work is kept." });
+        refresh();
+    }
+
+    const inputClass = "h-8 rounded-lg border border-border bg-background px-2 text-sm";
+
+    return (
+        <section aria-label="Offline PIN" className="mt-6 grid gap-3 rounded-lg border border-border p-4">
+            <h2 className="text-lg font-medium">Offline access</h2>
+            <p className="text-sm">
+                {state?.status === "available"
+                    ? `Offline access is ready on this device until ${new Date(state.expiresAt).toLocaleString()}.`
+                    : state?.status === "expired"
+                        ? "The offline session on this device has expired. It is renewed when you are signed in online."
+                        : "Offline access is not set up on this device."}
+            </p>
+            <p className="text-xs text-muted-foreground">
+                The PIN unlocks offline work on this device for up to 24 hours after your last online
+                check. It is not sent to the server, it does not sign you in to the server, and it is
+                not proof of payment. Five incorrect PINs remove offline access from this device;
+                queued work is always kept.
+            </p>
+
+            {result && (
+                <p role={result.kind === "error" ? "alert" : "status"} className="text-sm">
+                    {result.text}
+                </p>
+            )}
+
+            {!allowed ? (
+                <p className="text-sm">Your role is not allowed to record sales offline.</p>
+            ) : (
+                <form onSubmit={save} className="grid gap-3" noValidate>
+                    <label className="flex flex-col gap-1 text-sm">
+                        New offline PIN (at least 6 digits)
+                        <input className={inputClass} type="password" inputMode="numeric" autoComplete="off"
+                            value={pin} onChange={(e) => setPin(e.target.value)} maxLength={12} />
+                    </label>
+                    <label className="flex flex-col gap-1 text-sm">
+                        Confirm offline PIN
+                        <input className={inputClass} type="password" inputMode="numeric" autoComplete="off"
+                            value={confirmPin} onChange={(e) => setConfirmPin(e.target.value)} maxLength={12} />
+                    </label>
+                    <div className="flex flex-wrap gap-2">
+                        <Button type="submit" disabled={busy}>
+                            {busy ? "Saving…" : state?.status === "none" || !state ? "Set offline PIN" : "Change offline PIN"}
+                        </Button>
+                        {state && state.status !== "none" && (
+                            <Button type="button" variant="outline" disabled={busy} onClick={remove}>
+                                Remove offline access
+                            </Button>
+                        )}
+                    </div>
+                </form>
+            )}
+        </section>
+    );
+}
+
 export default function AccountPage() {
     const [me, setMe] = useState<Me | null>(null);
     const [loading, setLoading] = useState(true);
@@ -49,14 +204,36 @@ export default function AccountPage() {
     useEffect(() => {
         let cancelled = false;
 
-        fetch("/api/auth/me", { credentials: "include" })
-            .then(async (response) => {
+        settlePendingServerLogout()
+            .then(async (pending) => {
                 if (cancelled) return;
-                if (!response.ok) {
+                // An offline sign-out must end the old server session first.
+                if (pending === "done") {
                     setSignedOut(true);
                     return;
                 }
-                setMe(await response.json());
+                if (pending === "unreachable") {
+                    setNotice({ kind: "error", text: "Unable to contact the server to verify your session." });
+                    return;
+                }
+
+                const response = await fetch("/api/auth/me", { credentials: "include", cache: "no-store" });
+                if (cancelled) return;
+                if (isSessionRejected(response.status)) {
+                    // A definitive rejection ends the remembered identity and
+                    // its offline PIN session (queued offline work is kept).
+                    await endOfflineAccess().catch(() => undefined);
+                    setSignedOut(true);
+                    return;
+                }
+                if (!response.ok) {
+                    // A server error says nothing about the session.
+                    setNotice({ kind: "error", text: "Unable to contact the server to verify your session." });
+                    return;
+                }
+                const data = await response.json();
+                await confirmServerSession(data).catch(() => undefined);
+                if (!cancelled) setMe(data);
             })
             .catch(() => !cancelled && setNotice({ kind: "error", text: "Unable to connect to the server." }))
             .finally(() => !cancelled && setLoading(false));
@@ -82,6 +259,7 @@ export default function AccountPage() {
 
         if (!result.ok) {
             if (result.status === 401) {
+                await endOfflineAccess().catch(() => undefined);
                 setSignedOut(true);
                 return;
             }
@@ -95,6 +273,7 @@ export default function AccountPage() {
         setConfirmPassword("");
 
         if (result.data.requireLogin) {
+            await endOfflineAccess().catch(() => undefined);
             setSignedOut(true);
             return;
         }
@@ -120,9 +299,10 @@ export default function AccountPage() {
             return;
         }
 
-        // Offline work can no longer be queued for this account. Queued but
-        // unsynced items are kept and sync again when this account signs in.
-        await forgetSessionIdentity().catch(() => undefined);
+        // Offline work can no longer be queued for this account and its
+        // offline PIN session is removed. Queued but unsynced items are kept
+        // and sync again when this account signs in.
+        await endOfflineAccess().catch(() => undefined);
         setSignedOut(true);
     }
 
@@ -204,6 +384,8 @@ export default function AccountPage() {
                             </Button>
                         </div>
                     </form>
+
+                    {!me.user.mustChangePassword && <OfflinePinSection me={me} />}
 
                     <div className="mt-6 flex flex-wrap gap-2">
                         <Button variant="outline" disabled={busy !== null} onClick={() => logout(false)}>

@@ -87,3 +87,68 @@ export async function hasPermission({
             permissionRecord._id.toString()
     );
 }
+
+/**
+ * Which of several permissions the user currently holds. Same rules as
+ * hasPermission (active user in the tenant, the user's actual role, an
+ * active role of the same tenant), with one lookup per collection.
+ */
+export async function getGrantedPermissions({
+    userId,
+    tenantId,
+    roleId,
+    permissions,
+}: Omit<HasPermissionInput, "permission"> & { permissions: string[] }): Promise<Set<string>> {
+    const granted = new Set<string>();
+    const names = [...new Set(permissions.map((name) => name?.trim()).filter(Boolean))];
+
+    if (
+        !names.length ||
+        !roleId ||
+        !Types.ObjectId.isValid(userId) ||
+        !Types.ObjectId.isValid(tenantId) ||
+        !Types.ObjectId.isValid(roleId)
+    ) {
+        return granted;
+    }
+
+    const normalizedTenantId = new Types.ObjectId(tenantId);
+    const normalizedRoleId = new Types.ObjectId(roleId);
+
+    const user = await User.findOne({
+        _id: new Types.ObjectId(userId),
+        tenantId: normalizedTenantId,
+        status: "active",
+    })
+        .select("roleId")
+        .lean();
+
+    if (!user?.roleId || user.roleId.toString() !== normalizedRoleId.toString()) {
+        return granted;
+    }
+
+    const role = await Role.findOne({
+        _id: normalizedRoleId,
+        tenantId: normalizedTenantId,
+        status: "active",
+    })
+        .select("permissions")
+        .lean();
+
+    if (!role?.permissions?.length) {
+        return granted;
+    }
+
+    const rolePermissionIds = new Set(role.permissions.map((id) => id.toString()));
+    const records = await Permission.find({ name: { $in: names } })
+        .select("_id name")
+        .lean();
+
+    for (const record of records) {
+        if (rolePermissionIds.has(record._id.toString())) {
+            granted.add(record.name);
+        }
+    }
+
+    return granted;
+}

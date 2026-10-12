@@ -30,6 +30,8 @@ const CDP_COMMAND_TIMEOUT_MS = 30_000;
 export class Page {
     private nextId = 1;
     private pending = new Map<number, (value: { result?: unknown; error?: { message: string } }) => void>();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    private listeners = new Map<string, Set<(params: any) => void>>();
 
     private constructor(private socket: WebSocket) {
         socket.addEventListener("message", (event) => {
@@ -37,8 +39,18 @@ export class Page {
             if (message.id && this.pending.has(message.id)) {
                 this.pending.get(message.id)!(message);
                 this.pending.delete(message.id);
+            } else if (message.method) {
+                this.listeners.get(message.method)?.forEach((listener) => listener(message.params));
             }
         });
+    }
+
+    /** Subscribe to a DevTools event (e.g. "Fetch.requestPaused"). Returns an unsubscribe function. */
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    on(method: string, listener: (params: any) => void): () => void {
+        if (!this.listeners.has(method)) this.listeners.set(method, new Set());
+        this.listeners.get(method)!.add(listener);
+        return () => this.listeners.get(method)?.delete(listener);
     }
 
     static async connect(port: number): Promise<Page> {

@@ -2,6 +2,10 @@ import { NextRequest, NextResponse } from "next/server";
 
 import { Tax } from "@/lib/models/Tax";
 import { getAuthenticatedContext } from "@/lib/auth/getAuthenticatedContext";
+import {
+    BUSINESS_PERMISSIONS,
+    requireBusinessPermission,
+} from "@/lib/auth/businessPermissions";
 
 export async function GET(
     request: NextRequest
@@ -19,6 +23,15 @@ export async function GET(
                 },
                 { status: 401 }
             );
+        }
+
+        const denied = await requireBusinessPermission(
+            context,
+            BUSINESS_PERMISSIONS.taxesRead
+        );
+
+        if (denied) {
+            return denied;
         }
 
         // Get taxes belonging only to the authenticated tenant

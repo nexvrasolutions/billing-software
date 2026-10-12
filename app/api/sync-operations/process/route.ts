@@ -28,6 +28,7 @@ function errorJson(error: SyncProcessError) {
  * 400 invalid request            (retryable: false)
  * 401 not signed in
  * 403 OWNER_MISMATCH             (belongs to another user/device)
+ * 403 PERMISSION_DENIED          (role does not allow it now; NEEDS_ATTENTION)
  * 404 NOT_FOUND                  (upload it first)
  * 409 IN_PROGRESS                (retryable, see Retry-After)
  * 422 PERMANENT_FAILURE / NEEDS_ATTENTION (never retried automatically)
@@ -74,6 +75,7 @@ export async function POST(request: NextRequest) {
                 tenantId: new mongoose.Types.ObjectId(authContext.tenantId),
                 userId: new mongoose.Types.ObjectId(authContext.userId),
                 deviceId: new mongoose.Types.ObjectId(authContext.deviceId),
+                roleId: authContext.roleId,
             },
             parsed.data.operationId
         );

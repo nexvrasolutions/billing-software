@@ -3,6 +3,16 @@
 
 import { useState, type FormEvent } from "react";
 import { useRouter } from "next/navigation";
+import {
+    confirmServerSession,
+    forgetSessionIdentity,
+    identityFromMe,
+    rememberSessionIdentity,
+} from "@/lib/offline/sessionIdentity";
+import {
+    clearPendingServerLogout,
+    settlePendingServerLogout,
+} from "@/lib/offline/offlineAccess";
 
 export default function LoginPage() {
     const router = useRouter();
@@ -20,6 +30,10 @@ export default function LoginPage() {
         setLoading(true);
 
         try {
+            // Step 0: an earlier offline sign-out must end the old server
+            // session (with its cookie) before a new sign-in replaces it.
+            await settlePendingServerLogout().catch(() => "unreachable" as const);
+
             // Step 1: Authenticate using email, password, and registered device ID.
             const response = await fetch("/api/auth/login", {
                 method: "POST",
@@ -35,6 +49,14 @@ export default function LoginPage() {
             });
 
             const data = await response.json().catch(() => null);
+
+            // The server answered this sign-in attempt, so it ends the previous
+            // account's offline identity: a failed or different login can never
+            // queue work under it. Without an answer (offline, network error)
+            // or with a server error (5xx), the identity is kept.
+            if (response.status < 500) {
+                await forgetSessionIdentity().catch(() => undefined);
+            }
 
             if (!response.ok || !data?.success) {
                 setError(
@@ -60,6 +82,26 @@ export default function LoginPage() {
                 );
                 return;
             }
+
+            // The new session cookie replaced the old one: no earlier offline
+            // sign-out is left to complete from this device.
+            await clearPendingServerLogout().catch(() => undefined);
+
+            // Step 2b: Record the server-confirmed identity (tenant, user,
+            // device) so offline work is attributed to this account only.
+            // Not for a temporary password: no offline work may be queued
+            // until it has been changed online, and that account's offline
+            // PIN session is removed. Otherwise an existing offline PIN
+            // session of this same account is renewed for 24 hours.
+            const identity = identityFromMe(meData);
+
+            if (meData?.user?.mustChangePassword !== true && identity) {
+                // If this fails, no identity is remembered (safe default):
+                // offline queueing then requires an online check first.
+                await rememberSessionIdentity(identity).catch(() => undefined);
+            }
+
+            await confirmServerSession(meData).catch(() => undefined);
 
             // Step 3: Preserve the temporary-password workflow.
             const user = meData?.user ?? meData?.data?.user ?? meData;
@@ -110,7 +152,7 @@ export default function LoginPage() {
                             value={email}
                             onChange={(event) => setEmail(event.target.value)}
                             className="w-full rounded-md border border-gray-300 px-3 py-2 text-sm outline-none focus:border-gray-900 focus:ring-1 focus:ring-gray-900"
-                            placeholder="you@company.com"
+                            placeholder="Enter your mail id"
                         />
                     </div>
 

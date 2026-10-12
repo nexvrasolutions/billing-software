@@ -3,6 +3,10 @@ import mongoose from "mongoose";
 
 import { StockService } from "@/lib/services/StockService";
 import { getAuthenticatedContext } from "@/lib/auth/getAuthenticatedContext";
+import {
+    BUSINESS_PERMISSIONS,
+    requireBusinessPermission,
+} from "@/lib/auth/businessPermissions";
 
 export async function POST(
     request: NextRequest
@@ -24,6 +28,16 @@ export async function POST(
                 },
                 { status: 401 }
             );
+        }
+
+        // Permission (the user's current role, checked on the server)
+        const denied = await requireBusinessPermission(
+            context,
+            BUSINESS_PERMISSIONS.stockAdjust
+        );
+
+        if (denied) {
+            return denied;
         }
 
         const body =

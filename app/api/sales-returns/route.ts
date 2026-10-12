@@ -3,6 +3,10 @@ import mongoose from "mongoose";
 
 import { SalesReturnService } from "@/lib/services/SalesReturnService";
 import { getAuthenticatedContext } from "@/lib/auth/getAuthenticatedContext";
+import {
+    BUSINESS_PERMISSIONS,
+    requireBusinessPermission,
+} from "@/lib/auth/businessPermissions";
 
 export async function POST(
     request: NextRequest
@@ -21,6 +25,16 @@ export async function POST(
                 },
                 { status: 401 }
             );
+        }
+
+        // 1b. Permission (the user's current role, checked on the server)
+        const denied = await requireBusinessPermission(
+            context,
+            BUSINESS_PERMISSIONS.salesReturnsCreate
+        );
+
+        if (denied) {
+            return denied;
         }
 
         // 2. Convert trusted session IDs to MongoDB ObjectIds

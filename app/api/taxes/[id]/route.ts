@@ -3,6 +3,10 @@ import mongoose from "mongoose";
 
 import { Tax } from "@/lib/models/Tax";
 import { getAuthenticatedContext } from "@/lib/auth/getAuthenticatedContext";
+import {
+    BUSINESS_PERMISSIONS,
+    requireBusinessPermission,
+} from "@/lib/auth/businessPermissions";
 
 export async function DELETE(
     request: NextRequest,
@@ -21,6 +25,15 @@ export async function DELETE(
                 },
                 { status: 401 }
             );
+        }
+
+        const denied = await requireBusinessPermission(
+            context,
+            BUSINESS_PERMISSIONS.taxesDelete
+        );
+
+        if (denied) {
+            return denied;
         }
 
         const { id } = await params;

@@ -14,6 +14,7 @@
 import { loadEnvConfig } from "@next/env";
 
 import { runTestSafely } from "./lib/testRunSafety";
+import { ensureTestPermissions } from "./lib/testPermissions";
 
 loadEnvConfig(process.cwd(), false, { info() {}, error() {} });
 
@@ -136,16 +137,18 @@ async function main() {
                     return found._id as ObjectId;
                 };
                 const usersAll = ["users.read", "users.create", "users.update", "users.delete"].map(perm);
+                // GET /api/taxes requires taxes.read (created for this run if missing).
+                const taxesRead = (await ensureTestPermissions(run, Permission, ["taxes.read"])).get("taxes.read")!;
 
                 const tenantA = run.newTenantId(); // registered before insert
                 await Tenant.create({ _id: tenantA, name: run.tenantName("A"), status: "active" });
                 const tenantB = run.newTenantId(); // registered before insert
                 await Tenant.create({ _id: tenantB, name: run.tenantName("B"), status: "active" });
 
-                const adminRole = (await Role.create({ tenantId: tenantA, name: "Admin", permissions: [...usersAll, perm("products.read")] }))._id as ObjectId;
-                // The reset target can normally read users and products, so a later
-                // 401 can only come from the restriction, not from missing permissions.
-                const staffRole = (await Role.create({ tenantId: tenantA, name: "Staff", permissions: [perm("users.read"), perm("products.read")] }))._id as ObjectId;
+                const adminRole = (await Role.create({ tenantId: tenantA, name: "Admin", permissions: [...usersAll, perm("products.read"), taxesRead] }))._id as ObjectId;
+                // The reset target can normally read users, products and taxes, so a
+                // later 401 can only come from the restriction, not from missing permissions.
+                const staffRole = (await Role.create({ tenantId: tenantA, name: "Staff", permissions: [perm("users.read"), perm("products.read"), taxesRead] }))._id as ObjectId;
                 const adminRoleB = (await Role.create({ tenantId: tenantB, name: "Admin", permissions: usersAll }))._id as ObjectId;
 
                 const originalPassword = `Original-${suffix}-Pw1!`;

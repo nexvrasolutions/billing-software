@@ -4,6 +4,7 @@ import { FormEvent, useCallback, useEffect, useState } from "react";
 import Link from "next/link";
 
 import { Button } from "@/components/ui/button";
+import { confirmServerSession, endOfflineAccess, isSessionRejected } from "@/lib/offline/sessionIdentity";
 
 /*
  * User Management screen.
@@ -132,6 +133,15 @@ export default function UsersPage() {
                 api("/api/auth/me").then((meResult) => {
                     if (!cancelled && meResult.ok && meResult.data.user?.mustChangePassword) {
                         setPasswordChangeRequired(true);
+                        // Temporary password: remove that account's offline
+                        // PIN session (queued offline work is kept).
+                        void confirmServerSession(meResult.data).catch(() => undefined);
+                    }
+                    // Session definitively rejected: forget the remembered
+                    // identity and its offline PIN session (queued offline
+                    // work is kept).
+                    if (isSessionRejected(meResult.status)) {
+                        void endOfflineAccess().catch(() => undefined);
                     }
                 });
                 return;

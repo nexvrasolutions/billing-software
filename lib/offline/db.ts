@@ -1,6 +1,7 @@
 import Dexie, { Table } from "dexie";
 
 import type { LocalSyncStatus, SessionIdentity } from "./syncPolicy";
+import type { OfflineSessionRecord } from "./offlineSession";
 
 export interface SyncQueueItem {
     id?: number;
@@ -57,9 +58,13 @@ export interface MetaRecord {
     value: unknown;
 }
 
+// Key of the last server-confirmed identity in the meta table.
+export const LAST_IDENTITY_KEY = "lastSessionIdentity";
+
 export class OfflineDatabase extends Dexie {
     syncQueue!: Table<SyncQueueItem, number>;
     meta!: Table<MetaRecord, string>;
+    offlineSessions!: Table<OfflineSessionRecord, string>;
 
     constructor() {
         super("billing_offline_db");
@@ -86,6 +91,15 @@ export class OfflineDatabase extends Dexie {
                     }
                 });
             });
+
+        // Version 3: PIN-protected offline sessions (one per tenant + user +
+        // device). Only a new table: existing tables and queued operations
+        // are kept exactly as they are (no upgrade function).
+        this.version(3).stores({
+            syncQueue: "++id, operationId, status, localSeq, createdAt, ownerUserId",
+            meta: "key",
+            offlineSessions: "key",
+        });
     }
 }
 

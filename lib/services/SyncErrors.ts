@@ -23,6 +23,7 @@ export type SyncFailureKind = "RETRYABLE" | "PERMANENT";
 export type SyncErrorCode =
     | "INVALID_REQUEST"
     | "OWNER_MISMATCH"
+    | "PERMISSION_DENIED"
     | "NOT_FOUND"
     | "OPERATION_ID_CONFLICT"
     | "IN_PROGRESS"

@@ -105,12 +105,12 @@ async function main() {
                 const adminRole = await Role.create({ tenantId: tid, name: "Admin", permissions: perms.map((p) => p._id) });
                 const productsRead = await Permission.findOne({ name: "products.read" }).select("_id").lean();
                 if (!productsRead) throw new Error("products.read permission missing");
-                await Role.create({ tenantId: tid, name: "Cashier", permissions: [productsRead._id] });
+                const cashierRole = await Role.create({ tenantId: tid, name: "Cashier", permissions: [productsRead._id] });
 
-                async function makeUser(label: string, password: string) {
+                async function makeUser(label: string, password: string, roleId = adminRole._id) {
                     const email = `${label}-${suffix}@example.invalid`;
                     registerEmail(email);
-                    const user = await User.create({ tenantId: tid, name: `Browser ${label}`, email, passwordHash: await hashPassword(password), roleId: adminRole._id, status: "active" });
+                    const user = await User.create({ tenantId: tid, name: `Browser ${label}`, email, passwordHash: await hashPassword(password), roleId, status: "active" });
                     const deviceId = `browser-${label}-${suffix}`;
                     await Device.create({ tenantId: tid, userId: user._id, deviceName: `${label} browser`, deviceType: "desktop", deviceId, status: "active" });
                     return { id: user._id.toString(), email, deviceId };
@@ -118,6 +118,9 @@ async function main() {
 
                 const owner = await makeUser("owner", ownerPassword);
                 const manager = await makeUser("manager", managerPassword);
+                // Cashier role: no users.* permission (products.read only).
+                const viewerPassword = `Browser-Viewer-${suffix}-1!`;
+                const viewer = await makeUser("viewer", viewerPassword, cashierRole._id);
                 await Tenant.updateOne({ _id: tid }, { $set: { ownerUserId: new mongoose.Types.ObjectId(owner.id) } });
                 const newUserEmail = `new-${suffix}@example.invalid`;
                 registerEmail(newUserEmail);
@@ -129,15 +132,41 @@ async function main() {
                     await page!.fill(`document.querySelector('input[type=email]')`, email);
                     await page!.fill(`document.querySelector('input[type=password]')`, password);
                     await page!.fill(`document.querySelector('input[type=text]')`, deviceId);
-                    await page!.clickButton("Login");
+                    await page!.clickButton("Sign in");
                 }
+
+                // The current login page redirects to /dashboard on success.
+                const landedOnDashboard = async () =>
+                    (await page!.waitFor(`location.pathname === "/dashboard"`)) && (await page!.waitForText("Dashboard"));
 
                 // ----------------------------------------------------------- login
                 await login(owner.email, "Definitely-Wrong-Pass-1", owner.deviceId);
-                check("B1. Invalid login shows a clear error", await page.waitForText("Invalid email or password"));
+                check(
+                    "B1. Invalid login shows a clear error and stays on the login page",
+                    (await page.waitForText("Invalid email or password")) && (await page.eval<string>("location.pathname")) === "/login"
+                );
 
                 await login(owner.email, ownerPassword, owner.deviceId);
-                check("B2. Valid login succeeds and offers the User Management link", await page.waitForText("Login successful.") && await page.waitForText("Go to User Management"));
+                check("B2. Valid login succeeds and redirects to the dashboard", await landedOnDashboard());
+
+                // Dashboard navigation (links only; pages enforce their own access).
+                const clickLink = (text: string) => page!.eval<boolean>(`(() => {
+                    const link = [...document.querySelectorAll("a")].find((a) => a.innerText.trim() === ${JSON.stringify(text)});
+                    if (!link) return false;
+                    link.click();
+                    return true;
+                })()`);
+                check(
+                    "B2. Dashboard links to User Management (/users) and My account (/account)",
+                    await page.waitFor(`(() => {
+                        const href = (t) => [...document.querySelectorAll("a")].find((a) => a.innerText.trim() === t)?.getAttribute("href");
+                        return href("User Management") === "/users" && href("My account") === "/account";
+                    })()`)
+                );
+                check(
+                    "B2. The User Management link opens the user list",
+                    (await clickLink("User Management")) && (await page.waitFor(`location.pathname === "/users"`)) && (await page.waitFor(rowFor(owner.email)))
+                );
 
                 // ------------------------------------------------------ users page
                 await page.goto("/users");
@@ -212,15 +241,22 @@ async function main() {
                 check("B11. Log out signs the user out", await page.waitForText("You are signed out."));
                 await page.goto("/users");
                 check("B11. After logout, User Management asks to log in", await page.waitForText("not logged in"));
+                await page.goto("/account");
+                check("B11. After logout, My account shows the signed-out state", await page.waitForText("You are signed out."));
+                await page.goto("/dashboard");
+                check(
+                    "B11. Signed out: /dashboard redirects to /login and never shows the dashboard",
+                    (await page.waitFor(`location.pathname === "/login"`)) && !(await page.text()).includes("Welcome to your billing and inventory system.")
+                );
 
                 await login(owner.email, ownerPassword, owner.deviceId);
                 check("B12. Old password no longer works after the change", await page.waitForText("Invalid email or password"));
                 await login(owner.email, ownerNewPassword, owner.deviceId);
-                check("B12. New password works", await page.waitForText("Login successful."));
+                check("B12. New password works", await landedOnDashboard());
 
                 // ---------------------------------------- ordinary admin restrictions
                 await login(manager.email, managerPassword, manager.deviceId);
-                await page.waitForText("Login successful.");
+                await landedOnDashboard();
                 await page.goto("/users");
                 await page.waitFor(rowFor(owner.email));
                 check(
@@ -250,7 +286,7 @@ async function main() {
                 const managerTempPassword = `Browser-Temp-${suffix}-1!`;
                 const managerChosenPassword = `Browser-Chosen-${suffix}-1!`;
                 await login(owner.email, ownerNewPassword, owner.deviceId);
-                await page.waitForText("Login successful.");
+                await landedOnDashboard();
                 await page.goto("/users");
                 await page.waitFor(rowFor(manager.email));
                 await page.clickButton("Edit", rowFor(manager.email));
@@ -267,6 +303,11 @@ async function main() {
                 );
                 await page.goto("/users");
                 check("B18. User Management is blocked and explains why", await page.waitForText("You must change your temporary password before using this page."));
+                await page.goto("/dashboard");
+                check(
+                    "B18. With a temporary password, /dashboard redirects to My account",
+                    (await page.waitFor(`location.pathname === "/account"`)) && (await page.waitForText("An administrator reset your password."))
+                );
 
                 await page.goto("/account");
                 await page.waitForText("Signed in as");
@@ -282,6 +323,22 @@ async function main() {
                 await page.goto("/users");
                 check("B19. User Management works again after the change", await page.waitFor(rowFor(owner.email)));
                 check("B19. Database confirms the restriction is lifted", (await User.findById(manager.id).lean())?.mustChangePassword === false);
+
+                // ------------------- dashboard links never grant extra access
+                await login(viewer.email, viewerPassword, viewer.deviceId);
+                check("B20. A user without users.read can reach the dashboard", await landedOnDashboard());
+                check(
+                    "B20. Following User Management does not grant access (/users shows Permission denied, no user rows)",
+                    (await clickLink("User Management")) && (await page.waitFor(`location.pathname === "/users"`))
+                    && (await page.waitForText("Permission denied")) && !(await page.eval<boolean>(`Boolean(${rowFor(owner.email)})`))
+                );
+                await page.goto("/dashboard");
+                await landedOnDashboard();
+                check(
+                    "B20. The My account link opens the user's own account page",
+                    (await clickLink("My account")) && (await page.waitFor(`location.pathname === "/account"`))
+                    && (await page.waitForText("Signed in as")) && (await page.text()).includes(viewer.email)
+                );
 
                 const auditActions = (await AuditLog.find({ tenantId: tid }).select("action").lean()).map((a) => a.action);
                 check(

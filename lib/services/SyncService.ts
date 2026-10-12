@@ -2,7 +2,15 @@
 import {
     SalesService,
     type CreateSaleInput,
+    type SalePolicy,
 } from "@/lib/services/SalesService";
+
+import {
+    BUSINESS_PERMISSIONS,
+    SALE_DATE_RULES,
+    getGrantedBusinessPermissions,
+    getSyncEntityPermission,
+} from "@/lib/auth/businessPermissions";
 
 import {
     PurchaseService,
@@ -46,6 +54,8 @@ export interface SyncUserContext {
     // Identity of the authenticated session processing the operation.
     userId: mongoose.Types.ObjectId;
     deviceId: mongoose.Types.ObjectId;
+    // The session user's CURRENT role (from the database, not the token).
+    roleId?: string;
 }
 
 // ============================================================
@@ -860,24 +870,56 @@ export class SyncService {
             );
         }
 
+        // 4b. Deny by default: an operation type without an explicit
+        //     permission mapping is rejected BEFORE it is claimed, so no
+        //     business code runs for it. It is flagged for review (status
+        //     only; ownership was verified in step 2).
+        const mappedPermission = getSyncEntityPermission(existingOperation.entityType);
+
+        if (!mappedPermission) {
+            const message = "This type of operation cannot be synchronized; it needs review";
+
+            await SyncOperation.updateOne(
+                {
+                    _id: existingOperation._id,
+                    tenantId: user.tenantId,
+                    status: { $in: ["PENDING", "FAILED"] },
+                },
+                { $set: { status: "NEEDS_ATTENTION", failureKind: "PERMANENT", errorMessage: message } }
+            );
+
+            throw new SyncProcessError(403, "PERMISSION_DENIED", message, false);
+        }
+
         // 5. Claim atomically with a lease. Claimable: PENDING, FAILED, or a
         //    PROCESSING claim whose lease expired (crashed/stalled worker).
         //    Legacy PROCESSING records without a lease are reclaimable once
         //    their last attempt is older than the lease duration.
+        //    The ownership rules of step 2 are part of the claim itself, so a
+        //    record whose owner changed after step 2 is never claimed: the
+        //    session's device, and the session's user (or no user at all on a
+        //    legacy record; that device's owner is checked in step 6).
         const now = new Date();
         const leaseToken = randomUUID();
         const operation = await SyncOperation.findOneAndUpdate(
             {
                 _id: existingOperation._id,
                 tenantId: user.tenantId,
+                deviceId: user.deviceId,
                 attempts: { $lt: MAX_SYNC_ATTEMPTS },
-                $or: [
-                    { status: { $in: ["PENDING", "FAILED"] } },
-                    { status: "PROCESSING", leaseExpiresAt: { $lt: now } },
+                $and: [
+                    // userId: null matches a missing or null userId (legacy).
+                    { $or: [{ userId: user.userId }, { userId: null }] },
                     {
-                        status: "PROCESSING",
-                        leaseExpiresAt: { $exists: false },
-                        lastAttemptAt: { $lt: new Date(now.getTime() - SYNC_LEASE_MS) },
+                        $or: [
+                            { status: { $in: ["PENDING", "FAILED"] } },
+                            { status: "PROCESSING", leaseExpiresAt: { $lt: now } },
+                            {
+                                status: "PROCESSING",
+                                leaseExpiresAt: { $exists: false },
+                                lastAttemptAt: { $lt: new Date(now.getTime() - SYNC_LEASE_MS) },
+                            },
+                        ],
                     },
                 ],
             },
@@ -896,6 +938,20 @@ export class SyncService {
 
         if (!operation) {
             const current = await SyncOperation.findById(existingOperation._id).lean();
+
+            // Not claimed because the owner changed after step 2.
+            if (
+                current &&
+                (!current.deviceId?.equals(user.deviceId) ||
+                    (current.userId && !current.userId.equals(user.userId)))
+            ) {
+                throw new SyncProcessError(
+                    403,
+                    "OWNER_MISMATCH",
+                    "This operation belongs to another user or device",
+                    false
+                );
+            }
 
             if (current?.status === "SYNCED") {
                 return { success: true, alreadySynced: true, operation: current };
@@ -944,15 +1000,63 @@ export class SyncService {
             }
 
             // 7. Business effects are attributed to the uploading user.
+            //    (Steps 2 and 6 guarantee this is the session's user.)
             const businessUser = {
                 userId: operation.userId ?? device.userId,
                 tenantId: user.tenantId,
+                deviceId: operation.deviceId,
+            };
+
+            // 7b. The user's CURRENT role must allow this operation. A
+            //     refusal is permanent: the operation needs review.
+            //     (Unmapped types never get here, see step 4b; re-checked
+            //     on the claimed record anyway, denying by default.)
+            const requiredPermission = getSyncEntityPermission(operation.entityType);
+
+            if (!requiredPermission) {
+                throw new SyncProcessError(
+                    403,
+                    "PERMISSION_DENIED",
+                    "This type of operation cannot be synchronized; it needs review",
+                    false
+                );
+            }
+
+            const granted = await getGrantedBusinessPermissions(
+                {
+                    userId: user.userId.toString(),
+                    tenantId: user.tenantId.toString(),
+                    roleId: user.roleId,
+                },
+                [
+                    requiredPermission,
+                    BUSINESS_PERMISSIONS.salesPriceOverride,
+                    BUSINESS_PERMISSIONS.salesBackdate,
+                ]
+            );
+
+            if (!granted.has(requiredPermission)) {
+                throw new SyncProcessError(
+                    403,
+                    "PERMISSION_DENIED",
+                    "You no longer have permission for this operation; it needs review",
+                    false
+                );
+            }
+
+            // Sale rules for offline sales: the date window is measured from
+            // when the server first received the operation (server time).
+            const salePolicy: SalePolicy = {
+                allowPriceOverride: granted.has(BUSINESS_PERMISSIONS.salesPriceOverride),
+                allowBackdate: granted.has(BUSINESS_PERMISSIONS.salesBackdate),
+                referenceTime: operation.createdAt ?? new Date(),
+                maxAgeMs: SALE_DATE_RULES.syncMaxAgeMs,
             };
 
             const payload = getPayloadObject(operation.payload);
 
             // 8. Idempotent business operation (see the per-entity services).
-            await SyncService.runBusinessOperation(businessUser, operation.entityType, payload, operation.operationId);
+            await SyncService.runBusinessOperation(businessUser, operation.entityType, payload, operation.operationId, salePolicy);
 
             // 9. Mark SYNCED. Normally only the lease holder may do this. If
             //    the lease expired meanwhile and another worker reclaimed the
@@ -1039,10 +1143,15 @@ export class SyncService {
     }
 
     private static async runBusinessOperation(
-        businessUser: { userId: mongoose.Types.ObjectId; tenantId: mongoose.Types.ObjectId },
+        businessUser: {
+            userId: mongoose.Types.ObjectId;
+            tenantId: mongoose.Types.ObjectId;
+            deviceId: mongoose.Types.ObjectId;
+        },
         entityType: string,
         payload: Record<string, unknown>,
-        operationId: string
+        operationId: string,
+        salePolicy: SalePolicy
     ) {
         const operation = { entityType, operationId };
 
@@ -1051,7 +1160,8 @@ export class SyncService {
                 await SalesService.createSale(
                     businessUser,
                     parseSalePayload(payload),
-                    operation.operationId
+                    operation.operationId,
+                    salePolicy
                 );
                 break;
             }

@@ -3,6 +3,10 @@ import mongoose from "mongoose";
 
 import { PaymentService } from "@/lib/services/PaymentService";
 import { getAuthenticatedContext } from "@/lib/auth/getAuthenticatedContext";
+import {
+    BUSINESS_PERMISSIONS,
+    requireBusinessPermission,
+} from "@/lib/auth/businessPermissions";
 
 export async function POST(request: NextRequest) {
     try {
@@ -17,6 +21,15 @@ export async function POST(request: NextRequest) {
                 },
                 { status: 401 }
             );
+        }
+
+        const denied = await requireBusinessPermission(
+            context,
+            BUSINESS_PERMISSIONS.paymentsCreate
+        );
+
+        if (denied) {
+            return denied;
         }
 
         const user = {
