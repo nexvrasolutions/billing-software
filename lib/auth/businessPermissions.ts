@@ -11,6 +11,7 @@ import { getGrantedPermissions } from "./hasPermission";
  * user's role at processing time).
  */
 export const BUSINESS_PERMISSIONS = {
+    productsCreate: "products.create",
     salesCreate: "sales.create",
     // Selling at a price other than the product's selling price, or with a discount.
     salesPriceOverride: "sales.priceOverride",
@@ -31,12 +32,14 @@ export type BusinessPermission = (typeof BUSINESS_PERMISSIONS)[keyof typeof BUSI
 
 /** Permission required to process each kind of queued offline operation. */
 export const SYNC_ENTITY_PERMISSIONS: Readonly<Record<string, BusinessPermission>> = Object.freeze({
+    Product: BUSINESS_PERMISSIONS.productsCreate,
     Sale: BUSINESS_PERMISSIONS.salesCreate,
     SalesReturn: BUSINESS_PERMISSIONS.salesReturnsCreate,
     Purchase: BUSINESS_PERMISSIONS.purchasesCreate,
     PurchaseReturn: BUSINESS_PERMISSIONS.purchaseReturnsCreate,
     Payment: BUSINESS_PERMISSIONS.paymentsCreate,
     StockAdjustment: BUSINESS_PERMISSIONS.stockAdjust,
+    Customer: BUSINESS_PERMISSIONS.salesCreate,
 });
 
 /**

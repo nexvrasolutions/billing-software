@@ -134,11 +134,11 @@ export default function UsersPage() {
                     if (!cancelled && meResult.ok && meResult.data.user?.mustChangePassword) {
                         setPasswordChangeRequired(true);
                         // Temporary password: remove that account's offline
-                        // PIN session (queued offline work is kept).
+                        // session (queued offline work is kept).
                         void confirmServerSession(meResult.data).catch(() => undefined);
                     }
                     // Session definitively rejected: forget the remembered
-                    // identity and its offline PIN session (queued offline
+                    // identity and its offline session (queued offline
                     // work is kept).
                     if (isSessionRejected(meResult.status)) {
                         void endOfflineAccess().catch(() => undefined);

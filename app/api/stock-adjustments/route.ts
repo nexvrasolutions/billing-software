@@ -7,6 +7,7 @@ import {
     BUSINESS_PERMISSIONS,
     requireBusinessPermission,
 } from "@/lib/auth/businessPermissions";
+import { publicErrorMessage } from "@/lib/api/publicError";
 
 export async function POST(
     request: NextRequest
@@ -216,9 +217,7 @@ export async function POST(
                 success: false,
 
                 message:
-                    error instanceof Error
-                        ? error.message
-                        : "Stock adjustment failed",
+                    publicErrorMessage(error, "Stock adjustment failed"),
             },
             { status: 500 }
         );

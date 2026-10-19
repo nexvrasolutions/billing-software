@@ -17,6 +17,10 @@ export interface IProduct extends Document {
 
     status: "active" | "inactive";
 
+    taxRate?: number;
+    hsnCode?: string;
+    operationId?: string;
+
     createdAt: Date;
     updatedAt: Date;
 }
@@ -46,6 +50,7 @@ const ProductSchema = new Schema<IProduct>(
         barcode: {
             type: String,
             trim: true,
+            uppercase: true,
         },
 
         categoryId: {
@@ -86,6 +91,22 @@ const ProductSchema = new Schema<IProduct>(
             enum: ["active", "inactive"],
             default: "active",
         },
+
+        taxRate: {
+            type: Number,
+            min: 0,
+            max: 100,
+        },
+
+        hsnCode: {
+            type: String,
+            trim: true,
+        },
+
+        operationId: {
+            type: String,
+            trim: true,
+        },
     },
     {
         timestamps: true,
@@ -101,7 +122,19 @@ ProductSchema.index(
     { tenantId: 1, barcode: 1 },
     {
         unique: true,
-        sparse: true,
+        partialFilterExpression: {
+            barcode: { $type: "string", $gt: "" },
+        },
+    }
+);
+
+ProductSchema.index(
+    { tenantId: 1, operationId: 1 },
+    {
+        unique: true,
+        partialFilterExpression: {
+            operationId: { $type: "string", $gt: "" },
+        },
     }
 );
 

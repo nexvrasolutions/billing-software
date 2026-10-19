@@ -8,8 +8,15 @@ import {
     type SessionPayload,
 } from "@/app/api/auth/session";
 
-/** Lifetime of a login session (also the cookie maxAge). */
-export const SESSION_TTL_SECONDS = 60 * 60 * 24 * 7;
+/**
+ * Lifetime of a login session: 24 hours from login, fixed (no idle timeout).
+ * This ONE constant sets the cookie Max-Age (login and change-password), the
+ * signed token's expiry and the database expiresAt of NEW sessions. Sessions
+ * created before this value was shortened keep the expiresAt they were stored
+ * with (up to 7 days) until they expire or are revoked; nothing is migrated.
+ * The 72-hour offline authorization is separate and is not affected.
+ */
+export const SESSION_TTL_SECONDS = 24 * 60 * 60;
 
 export function hashSessionId(sid: string): string {
     return createHash("sha256").update(sid).digest("hex");

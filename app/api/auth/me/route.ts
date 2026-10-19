@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
-import { connectDB } from "@/lib/db/mongodb";
+import { connectDB, isDatabaseConnectionError } from "@/lib/db/mongodb";
 import { User } from "@/lib/models/User";
 import { Tenant } from "@/lib/models/Tenant";
 import { Device } from "@/lib/models/Device";
@@ -107,6 +107,10 @@ export async function GET(request: NextRequest) {
         return NextResponse.json({
             success: true,
             authenticated: true,
+            // The server's clock. The browser bases the 72-hour offline
+            // window on it and refuses to renew it when the device clock
+            // differs by more than five minutes.
+            serverTime: new Date().toISOString(),
             permissions,
             user: {
                 id: user._id.toString(),
@@ -126,6 +130,9 @@ export async function GET(request: NextRequest) {
                 businessType:
                     tenant.businessType ??
                     null,
+                pricingMode:
+                    tenant.pricingMode ??
+                    "tax_inclusive",
             },
             device: {
                 id: device._id.toString(),
@@ -135,6 +142,18 @@ export async function GET(request: NextRequest) {
             },
         });
     } catch (error) {
+        if (isDatabaseConnectionError(error)) {
+            console.warn("Auth check: Database unavailable (Atlas offline); client using offline session.");
+            return NextResponse.json(
+                {
+                    success: false,
+                    message: "Database connection unavailable",
+                    offline: true,
+                },
+                { status: 503 }
+            );
+        }
+
         console.error(
             "Auth me error:",
             error

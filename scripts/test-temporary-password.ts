@@ -12,6 +12,7 @@
  */
 
 import { loadEnvConfig } from "@next/env";
+import { assertTestDatabaseUri } from "./lib/testDatabaseGuard";
 
 import { runTestSafely } from "./lib/testRunSafety";
 import { ensureTestPermissions } from "./lib/testPermissions";
@@ -42,6 +43,8 @@ async function main() {
     if (process.env.ALLOW_TEMP_PASSWORD_TESTS !== "YES") {
         throw new Error("Set ALLOW_TEMP_PASSWORD_TESTS=YES after confirming MONGODB_URI is a development database.");
     }
+    // Only the dedicated test database, checked before anything connects.
+    assertTestDatabaseUri(process.env.MONGODB_URI);
 
     process.env.LOGIN_TRUSTED_IP_HEADER = "x-forwarded-for";
 

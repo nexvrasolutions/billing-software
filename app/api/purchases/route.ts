@@ -7,6 +7,41 @@ import {
     BUSINESS_PERMISSIONS,
     requireBusinessPermission,
 } from "@/lib/auth/businessPermissions";
+import { publicErrorMessage } from "@/lib/api/publicError";
+
+import { connectDB } from "@/lib/db/mongodb";
+import { Purchase } from "@/lib/models/Purchase";
+
+export async function GET(request: NextRequest) {
+    try {
+        const context = await getAuthenticatedContext(request);
+        if (!context) {
+            return NextResponse.json(
+                { success: false, message: "Authentication required" },
+                { status: 401 }
+            );
+        }
+
+        await connectDB();
+        const purchases = await Purchase.find({
+            tenantId: new mongoose.Types.ObjectId(context.tenantId),
+        })
+            .sort({ createdAt: -1 })
+            .limit(100)
+            .lean();
+
+        return NextResponse.json({
+            success: true,
+            purchases,
+        });
+    } catch (error) {
+        console.error("GET PURCHASES ERROR:", error);
+        return NextResponse.json(
+            { success: false, message: "Failed to load purchases" },
+            { status: 500 }
+        );
+    }
+}
 
 export async function POST(
     request: NextRequest
@@ -76,9 +111,7 @@ export async function POST(
             {
                 success: false,
                 message:
-                    error instanceof Error
-                        ? error.message
-                        : "Failed to create purchase",
+                    publicErrorMessage(error, "Failed to create purchase"),
             },
             { status: 400 }
         );

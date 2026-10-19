@@ -3,32 +3,19 @@ import { NextRequest, NextResponse } from "next/server";
 import mongoose from "mongoose";
 import { z } from "zod";
 
-import { connectDB } from "@/lib/db/mongodb";
+import { connectDB, isDatabaseConnectionError } from "@/lib/db/mongodb";
 import { Product } from "@/lib/models/Product";
 import { Category } from "@/lib/models/Category";
 import { Unit } from "@/lib/models/Unit";
 import { getAuthenticatedContext } from "@/lib/auth/getAuthenticatedContext";
-import { hasPermission } from "@/lib/auth/hasPermission";
+import { hasPermission, getGrantedPermissions } from "@/lib/auth/hasPermission";
 import { AuditLogService } from "@/lib/services/AuditLogService";
-
-const createProductSchema = z
-    .object({
-        name: z.string().trim().min(1).max(200),
-        SKU: z.string().trim().min(1).max(100),
-        barcode: z.string().trim().max(100).optional(),
-        categoryId: z.string().refine(
-            (value) => mongoose.Types.ObjectId.isValid(value),
-            "Invalid category ID"
-        ),
-        unitId: z.string().refine(
-            (value) => mongoose.Types.ObjectId.isValid(value),
-            "Invalid unit ID"
-        ),
-        purchasePrice: z.number().finite().min(0),
-        sellingPrice: z.number().finite().min(0),
-        status: z.enum(["active", "inactive"]).optional(),
-    })
-    .strict();
+import {
+    PRODUCT_COST_PERMISSIONS,
+    hasCostPermission,
+    filterProductsList,
+} from "@/lib/catalog/productProjection";
+import { createProductSchema } from "@/lib/validations/product";
 
 // GET: List products belonging to the authenticated tenant.
 export async function GET(request: NextRequest) {
@@ -62,13 +49,41 @@ export async function GET(request: NextRequest) {
             );
         }
 
+        const includeCost = request.nextUrl.searchParams.get("includeCost") === "true";
+
+        if (includeCost) {
+            const granted = await getGrantedPermissions({
+                userId: auth.userId,
+                tenantId: auth.tenantId,
+                roleId: auth.roleId,
+                permissions: [...PRODUCT_COST_PERMISSIONS],
+            });
+
+            if (!hasCostPermission(granted)) {
+                return NextResponse.json(
+                    {
+                        success: false,
+                        message: "You do not have permission to view product purchase costs",
+                    },
+                    { status: 403 }
+                );
+            }
+        }
+
         await connectDB();
 
-        const products = await Product.find({
+        const query = Product.find({
             tenantId: new mongoose.Types.ObjectId(auth.tenantId),
-        })
-            .sort({ createdAt: -1 })
-            .lean();
+        }).sort({ createdAt: -1 });
+
+        if (!includeCost) {
+            query.select("-purchasePrice -__v");
+        } else {
+            query.select("-__v");
+        }
+
+        const rawProducts = await query.lean();
+        const products = filterProductsList(rawProducts, includeCost);
 
         return NextResponse.json({
             success: true,
@@ -76,6 +91,17 @@ export async function GET(request: NextRequest) {
             products,
         });
     } catch (error) {
+        if (isDatabaseConnectionError(error)) {
+            console.warn("GET /api/products: Database connection unavailable (Atlas offline)");
+            return NextResponse.json(
+                {
+                    success: false,
+                    message: "Database connection unavailable",
+                    offline: true,
+                },
+                { status: 503 }
+            );
+        }
         console.error("List products error:", error);
 
         return NextResponse.json(
@@ -194,17 +220,18 @@ export async function POST(request: NextRequest) {
             );
         }
 
-        // Normalize the SKU and check for existing duplicates.
+        // Normalize the SKU and clean optional barcode.
         const sku = data.SKU.toUpperCase();
+        const cleanBarcode = data.barcode?.trim() ? data.barcode.trim().toUpperCase() : undefined;
 
         const duplicateConditions: Record<string, unknown>[] = [
             { tenantId, SKU: sku },
         ];
 
-        if (data.barcode) {
+        if (cleanBarcode) {
             duplicateConditions.push({
                 tenantId,
-                barcode: data.barcode,
+                barcode: cleanBarcode,
             });
         }
 
@@ -215,11 +242,24 @@ export async function POST(request: NextRequest) {
             .lean();
 
         if (duplicate) {
+            const isSkuMatch = duplicate.SKU?.toUpperCase() === sku;
+            const isBarcodeMatch = Boolean(
+                cleanBarcode &&
+                duplicate.barcode &&
+                duplicate.barcode.trim().toUpperCase() === cleanBarcode
+            );
+
+            let message = "A product with this SKU or barcode already exists";
+            if (isSkuMatch && !isBarcodeMatch) {
+                message = "A product with this SKU already exists";
+            } else if (isBarcodeMatch && !isSkuMatch) {
+                message = "A product with this barcode already exists";
+            }
+
             return NextResponse.json(
                 {
                     success: false,
-                    message:
-                        "A product with this SKU or barcode already exists",
+                    message,
                 },
                 { status: 409 }
             );
@@ -236,8 +276,8 @@ export async function POST(request: NextRequest) {
                             tenantId,
                             name: data.name,
                             SKU: sku,
-                            ...(data.barcode
-                                ? { barcode: data.barcode }
+                            ...(cleanBarcode
+                                ? { barcode: cleanBarcode }
                                 : {}),
                             categoryId: new mongoose.Types.ObjectId(
                                 data.categoryId
@@ -246,6 +286,12 @@ export async function POST(request: NextRequest) {
                             purchasePrice: data.purchasePrice,
                             sellingPrice: data.sellingPrice,
                             stockQuantity: 0,
+                            ...(typeof data.taxRate === "number"
+                                ? { taxRate: data.taxRate }
+                                : {}),
+                            ...(data.hsnCode?.trim()
+                                ? { hsnCode: data.hsnCode.trim() }
+                                : {}),
                             status: data.status ?? "active",
                         },
                     ],
@@ -271,6 +317,8 @@ export async function POST(request: NextRequest) {
                             purchasePrice: product.purchasePrice,
                             sellingPrice: product.sellingPrice,
                             stockQuantity: product.stockQuantity,
+                            taxRate: product.taxRate,
+                            hsnCode: product.hsnCode,
                             status: product.status,
                         },
                     },
@@ -305,13 +353,36 @@ export async function POST(request: NextRequest) {
             "code" in error &&
             error.code === 11000
         ) {
+            const keyPattern = (error as { keyPattern?: Record<string, unknown> }).keyPattern;
+            let message = "A product with this SKU or barcode already exists";
+            if (keyPattern) {
+                if (keyPattern.barcode) {
+                    message = "A product with this barcode already exists";
+                } else if (keyPattern.SKU) {
+                    message = "A product with this SKU already exists";
+                } else if (keyPattern.operationId) {
+                    message = "A product with this operation ID already exists";
+                }
+            }
+
             return NextResponse.json(
                 {
                     success: false,
-                    message:
-                        "A product with this SKU or barcode already exists",
+                    message,
                 },
                 { status: 409 }
+            );
+        }
+
+        if (isDatabaseConnectionError(error)) {
+            console.warn("POST /api/products: Database connection unavailable (Atlas offline)");
+            return NextResponse.json(
+                {
+                    success: false,
+                    message: "Database connection unavailable",
+                    offline: true,
+                },
+                { status: 503 }
             );
         }
 

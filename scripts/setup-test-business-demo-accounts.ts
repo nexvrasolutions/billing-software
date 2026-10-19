@@ -258,7 +258,7 @@ async function main() {
                 console.log(`Reusing existing user without changing password: ${account.email}`);
             }
 
-            let device = await Device.findOne({
+            const device = await Device.findOne({
                 tenantId,
                 deviceId: account.deviceId,
             });

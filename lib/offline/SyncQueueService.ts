@@ -1,5 +1,6 @@
 import { offlineDB, SyncQueueItem } from "./db";
-import { getIdentityForQueueing } from "./sessionIdentity";
+import { assertQueueItemDeletable } from "./pendingGuard";
+import { fetchSessionIdentity, getIdentityForQueueing } from "./sessionIdentity";
 import { newOperationId, type SessionIdentity } from "./syncPolicy";
 
 /**
@@ -12,12 +13,14 @@ export async function addToSyncQueue(item: {
     entityType: SyncQueueItem["entityType"];
     payload: Record<string, unknown>;
     localSeq?: number;
+    dependsOn?: string[];
+    operationId?: string;
 }) {
     const owner = await getIdentityForQueueing();
     const now = new Date().toISOString();
 
     const queueItem: SyncQueueItem = {
-        operationId: newOperationId(),
+        operationId: item.operationId || newOperationId(),
         operationType: item.operationType,
         entityType: item.entityType,
         payload: item.payload,
@@ -28,6 +31,7 @@ export async function addToSyncQueue(item: {
         nextAttemptAt: now,
         owner,
         ownerUserId: owner.userId,
+        ...(item.dependsOn && item.dependsOn.length > 0 ? { dependsOn: item.dependsOn } : {}),
     };
 
     const id = await offlineDB.syncQueue.add(queueItem);
@@ -93,24 +97,40 @@ export async function markAttemptFailed(
     });
 }
 
-/** Put an item back without counting an attempt (e.g. wrong session). */
-export async function releaseItem(id: number, status: "PENDING" | "FAILED") {
-    await offlineDB.syncQueue.update(id, { status, syncingSince: undefined });
+/**
+ * Put an item back without counting an attempt (e.g. wrong session or a
+ * refused Origin). With `restore`, lastAttemptAt also returns to the value it
+ * had before markSyncing, so the item ends up exactly as it was.
+ */
+export async function releaseItem(
+    id: number,
+    status: "PENDING" | "FAILED",
+    restore?: { lastAttemptAt?: string }
+) {
+    await offlineDB.syncQueue.update(id, {
+        status,
+        syncingSince: undefined,
+        ...(restore ? { lastAttemptAt: restore.lastAttemptAt } : {}),
+    });
 }
 
+/**
+ * Delete a queue item. Pending work is protected: only a SYNCED item owned
+ * by the account currently signed in (confirmed with the server, without
+ * renewing the offline authorization) can be deleted. Anything else throws
+ * and nothing is removed.
+ */
 export async function deleteSyncQueueItem(
     operationId: string
 ) {
     const item =
         await getSyncQueueItem(operationId);
 
-    if (!item) {
-        throw new Error(
-            "Sync queue item not found"
-        );
-    }
+    const identity = item ? await fetchSessionIdentity() : null;
+
+    assertQueueItemDeletable(item, identity);
 
     await offlineDB.syncQueue.delete(
-        item.id!
+        item!.id!
     );
 }

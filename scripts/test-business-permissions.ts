@@ -18,6 +18,7 @@
  */
 
 import { loadEnvConfig } from "@next/env";
+import { assertTestDatabaseUri } from "./lib/testDatabaseGuard";
 
 import { runTestSafely } from "./lib/testRunSafety";
 import { ensureTestPermissions } from "./lib/testPermissions";
@@ -50,6 +51,8 @@ async function main() {
     if (process.env.ALLOW_BUSINESS_PERMISSION_TESTS !== "YES") {
         throw new Error("Set ALLOW_BUSINESS_PERMISSION_TESTS=YES after confirming MONGODB_URI is a development database.");
     }
+    // Only the dedicated test database, checked before anything connects.
+    assertTestDatabaseUri(process.env.MONGODB_URI);
     if (process.env.TEST_AUDIT_LOG_FAILURE) {
         throw new Error("Unset TEST_AUDIT_LOG_FAILURE before running these tests.");
     }

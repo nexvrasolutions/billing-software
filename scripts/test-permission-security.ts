@@ -1,5 +1,6 @@
 
 import { loadEnvConfig } from "@next/env";
+import { assertTestDatabaseUri } from "./lib/testDatabaseGuard";
 loadEnvConfig(process.cwd());
 
 import mongoose from "mongoose";
@@ -11,6 +12,10 @@ import { Tenant } from "../lib/models/Tenant";
 import { hasPermission } from "../lib/auth/hasPermission";
 
 async function main() {
+    // Only the dedicated test database, checked before anything connects
+    // (this script has no allow flag and creates and deletes records).
+    assertTestDatabaseUri(process.env.MONGODB_URI);
+
     const createdUserIds: mongoose.Types.ObjectId[] = [];
     const createdRoleIds: mongoose.Types.ObjectId[] = [];
     const createdTenantIds: mongoose.Types.ObjectId[] = [];

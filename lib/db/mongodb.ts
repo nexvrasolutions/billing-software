@@ -131,3 +131,30 @@ export async function connectDB(): Promise<typeof mongoose> {
 
     return cached.conn;
 }
+
+/**
+ * Detect whether an error is caused by database connectivity/DNS failure
+ * (e.g. MongoDB Atlas unreachable when offline, server selection timeout, network down).
+ */
+export function isDatabaseConnectionError(error: unknown): boolean {
+    if (!error || typeof error !== "object") return false;
+    const err = error as { name?: string; message?: string; code?: string };
+    const name = err.name || "";
+    const msg = err.message || "";
+    const code = err.code || "";
+
+    return (
+        name === "MongoServerSelectionError" ||
+        name === "MongooseServerSelectionError" ||
+        name === "MongoNetworkError" ||
+        name === "MongoTimeoutError" ||
+        name === "MongoNotConnectedError" ||
+        name === "MongoTopologyClosedError" ||
+        code === "ENOTFOUND" ||
+        code === "ETIMEDOUT" ||
+        code === "ECONNREFUSED" ||
+        msg.includes("ENOTFOUND") ||
+        msg.includes("Server selection timed out") ||
+        msg.includes("buffering timed out")
+    );
+}

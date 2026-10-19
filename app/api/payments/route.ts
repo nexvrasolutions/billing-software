@@ -7,6 +7,7 @@ import {
     BUSINESS_PERMISSIONS,
     requireBusinessPermission,
 } from "@/lib/auth/businessPermissions";
+import { publicErrorMessage } from "@/lib/api/publicError";
 
 export async function POST(request: NextRequest) {
     try {
@@ -77,9 +78,7 @@ export async function POST(request: NextRequest) {
                 success: false,
 
                 message:
-                    error instanceof Error
-                        ? error.message
-                        : "Failed to process payment",
+                    publicErrorMessage(error, "Failed to process payment"),
             },
             {
                 status: 400,

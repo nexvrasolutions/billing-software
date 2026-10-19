@@ -17,12 +17,12 @@ const objectIdSchema = z.string().regex(/^[a-f\d]{24}$/i, "Invalid ID");
 const MAX_PAYLOAD_BYTES = 100_000;
 
 const uploadSchema = z.strictObject({
-    // Generated on the device with crypto.randomUUID().
-    operationId: z.uuid("operationId must be a UUID"),
+    // Generated on the device with crypto.randomUUID() or stable string.
+    operationId: z.string().trim().min(1).max(200),
     // Processing always creates records, so only CREATE is accepted.
     operationType: z.literal("CREATE"),
     // Only entity types the server can actually process.
-    entityType: z.enum(["Sale", "Purchase", "SalesReturn", "PurchaseReturn", "Payment", "StockAdjustment"]),
+    entityType: z.enum(["Sale", "Purchase", "SalesReturn", "PurchaseReturn", "Payment", "StockAdjustment", "Product", "Customer"]),
     entityId: objectIdSchema.optional(),
     payload: z.record(z.string(), z.unknown()),
     // The account that queued the operation on the device. It is only

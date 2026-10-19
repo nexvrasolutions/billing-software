@@ -7,6 +7,7 @@ import {
     BUSINESS_PERMISSIONS,
     requireBusinessPermission,
 } from "@/lib/auth/businessPermissions";
+import { publicErrorMessage } from "@/lib/api/publicError";
 
 export async function POST(
     request: NextRequest
@@ -76,9 +77,7 @@ export async function POST(
             {
                 success: false,
                 message:
-                    error instanceof Error
-                        ? error.message
-                        : "Failed to create sales return",
+                    publicErrorMessage(error, "Failed to create sales return"),
             },
             { status: 400 }
         );

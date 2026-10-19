@@ -1,0 +1,1 @@
+(()=>{"use strict";self.addEventListener("activate",e=>{e.waitUntil(caches.delete("apis"))})})();
