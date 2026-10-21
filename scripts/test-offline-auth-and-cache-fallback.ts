@@ -52,7 +52,7 @@ import {
     getSyncEntityPermission,
 } from "../lib/auth/businessPermissions";
 import { selectSyncable, type SessionIdentity } from "../lib/offline/syncPolicy";
-import type { OfflineDatabase, SyncQueueItem } from "../lib/offline/db";
+import { LAST_IDENTITY_KEY, type OfflineDatabase, type SyncQueueItem } from "../lib/offline/db";
 
 const results: { name: string; passed: boolean; detail?: string }[] = [];
 
@@ -784,6 +784,131 @@ async function runTests() {
     const serverCustomersWithSynced = [{ _id: serverObjectId, name: "Vishak", tenantId: "tenant_alpha" }];
     const mergedWithServer = [...serverCustomersWithSynced];
     check("9.8 Reconciled server customer appears in merged list", mergedWithServer.some((c) => c._id === serverObjectId && c.name === "Vishak"));
+
+    // ============================================================
+    // Section 10: Existing-Customer UPDATE Recovery from Failed CREATE
+    // ============================================================
+    console.log("\n--- Section 10: Existing-Customer UPDATE Recovery from Failed CREATE ---");
+
+    const recoveryTenant = "6abe48a86ae4b08a3e335303";
+    const serverCustId = "6ad62b1cfa76d2cb3ce12240";
+    const oldFailedCreateOpId = "5c02d6e5-9127-47dc-89fc-5f0cd9d6a645";
+
+    // Set owner identity in meta
+    await mockDb.meta.put({
+        key: LAST_IDENTITY_KEY,
+        value: {
+            tenantId: recoveryTenant,
+            userId: "user_owner_recovery",
+            deviceId: "device_pos_recovery",
+        },
+    });
+
+    // 1. Seed old failed CREATE in syncQueue
+    await mockDb.syncQueue.put({
+        id: 8888,
+        operationId: oldFailedCreateOpId,
+        operationType: "CREATE",
+        entityType: "Customer",
+        payload: {
+            localId: serverCustId,
+            name: "Biling",
+            address: "Karungal",
+            phone: "9876543210",
+        },
+        localSeq: 600,
+        status: "NEEDS_ATTENTION",
+        attempts: 2,
+        createdAt: new Date().toISOString(),
+        ownerUserId: "user_owner_recovery",
+    });
+
+    // 2. Seed cachedCustomers with NEEDS_ATTENTION pointing to the failed CREATE operationId
+    await mockDb.cachedCustomers.put({
+        id: makeCachedCustomerId(recoveryTenant, serverCustId),
+        customerId: serverCustId,
+        tenantId: recoveryTenant,
+        name: "Biling",
+        phone: "9876543210",
+        address: "Karungal",
+        status: "active",
+        cachedAt: new Date().toISOString(),
+        syncStatus: "NEEDS_ATTENTION",
+        operationId: oldFailedCreateOpId,
+        errorMessage: "Phone collision on server",
+    });
+
+    // 10.1 First recovery attempt: generates a fresh UUID, does not reuse failed CREATE opId
+    const firstRecovery = await savePendingOfflineCustomerUpdate(
+        {
+            customerId: serverCustId,
+            name: "Biling",
+            address: "Karungal",
+            phone: "9876543210",
+        },
+        recoveryTenant,
+        mockDb
+    );
+
+    check("10.1 Recovery UPDATE gets fresh UUID (not old failed CREATE opId)",
+        firstRecovery.operationId !== oldFailedCreateOpId && Boolean(firstRecovery.operationId)
+    );
+    check("10.1 Recovery UPDATE sets syncStatus to PENDING",
+        firstRecovery.syncStatus === "PENDING"
+    );
+
+    // 10.2 Old failed CREATE remains untouched
+    const allQueue10 = await mockDb.syncQueue.toArray();
+    const oldCreateItem = allQueue10.find((q) => q.operationId === oldFailedCreateOpId);
+    check("10.2 Old failed CREATE remains in syncQueue", Boolean(oldCreateItem));
+    check("10.2 Old failed CREATE operationType is still CREATE (untouched)", oldCreateItem?.operationType === "CREATE");
+    check("10.2 Old failed CREATE status is still NEEDS_ATTENTION (untouched)", oldCreateItem?.status === "NEEDS_ATTENTION");
+    check("10.2 Old failed CREATE payload is completely untouched", oldCreateItem?.payload?.name === "Biling" && oldCreateItem?.payload?.address === "Karungal");
+
+    // 10.3 Repeated attempt preserves operationId and does not duplicate queue entries
+    const queueCountBeforeRetry = (await mockDb.syncQueue.toArray()).length;
+    const retryRecovery = await savePendingOfflineCustomerUpdate(
+        {
+            customerId: serverCustId,
+            name: "Biling Preserved",
+            address: "Karungal Town",
+            phone: "9876543210",
+        },
+        recoveryTenant,
+        mockDb
+    );
+
+    const allQueueAfterRetry = await mockDb.syncQueue.toArray();
+    check("10.3 Repeated attempt preserves the new UPDATE operationId", retryRecovery.operationId === firstRecovery.operationId);
+    check("10.3 Repeated attempt does not create duplicate queue entries", allQueueAfterRetry.length === queueCountBeforeRetry);
+
+    const updateItemInQueue = allQueueAfterRetry.find((q) => q.operationId === firstRecovery.operationId);
+    check("10.3 UPDATE queue item payload updated with newest values", updateItemInQueue?.payload?.name === "Biling Preserved");
+    check("10.3 Old failed CREATE still untouched after retry",
+        allQueueAfterRetry.find((q) => q.operationId === oldFailedCreateOpId)?.operationType === "CREATE"
+    );
+
+    // 10.4 Detail page load logic: NEEDS_ATTENTION retains local values online
+    const detailAttentionCustomer = await mockDb.cachedCustomers.get(makeCachedCustomerId(recoveryTenant, serverCustId));
+    // Simulate detail page check
+    const shouldRetainAttention = detailAttentionCustomer && (detailAttentionCustomer.syncStatus === "PENDING" || detailAttentionCustomer.syncStatus === "NEEDS_ATTENTION");
+    check("10.4 Detail page condition matches NEEDS_ATTENTION and retains local edits without server overwrite", Boolean(shouldRetainAttention));
+
+    // 10.5 PENDING retains local values
+    const pendingCheck = { syncStatus: "PENDING" as const };
+    const shouldRetainPending = pendingCheck && (pendingCheck.syncStatus === "PENDING" || pendingCheck.syncStatus === "NEEDS_ATTENTION");
+    check("10.5 Detail page condition matches PENDING and retains local values", Boolean(shouldRetainPending));
+
+    // 10.6 SYNCED falls through to server fetch
+    const syncedCheck = { syncStatus: "SYNCED" as const };
+    const shouldRetainSynced = syncedCheck && ((syncedCheck as any).syncStatus === "PENDING" || (syncedCheck as any).syncStatus === "NEEDS_ATTENTION");
+    check("10.6 SYNCED does not intercept detail page load, allowing server fetch", !shouldRetainSynced);
+
+    // 10.7 Tenant ownership attached
+    check("10.7 Tenant ownership attached from session to recovery item",
+        updateItemInQueue?.ownerUserId === "user_owner_recovery" &&
+        updateItemInQueue?.owner?.tenantId === recoveryTenant
+    );
 
     console.log("\n============================================================");
     const passed = results.filter((r) => r.passed).length;

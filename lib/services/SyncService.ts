@@ -35,6 +35,7 @@ import {
 import { StockService } from "./StockService";
 import { ProductSyncService } from "./ProductSyncService";
 import { CustomerSyncService } from "./CustomerSyncService";
+import { SupplierSyncService } from "./SupplierSyncService";
 import { Device } from "../models/Device";
 import { Sale } from "../models/Sale";
 import mongoose from "mongoose";
@@ -1347,8 +1348,17 @@ export class SyncService {
             }
 
             case "Supplier": {
-                throw new Error(
-                    "Supplier synchronization is not implemented yet"
+                if (operation.operationType === "UPDATE") {
+                    return await SupplierSyncService.updateSupplierFromSync(
+                        businessUser,
+                        payload,
+                        operation.operationId
+                    );
+                }
+                return await SupplierSyncService.createSupplierFromSync(
+                    businessUser,
+                    payload,
+                    operation.operationId
                 );
             }
 

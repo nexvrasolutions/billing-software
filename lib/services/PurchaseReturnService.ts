@@ -204,22 +204,23 @@ export class PurchaseReturnService {
 
 
                 // =========================================================
-                // 6. SUPPLIER
+                // 6. SUPPLIER (HISTORICAL RETURN COMPATIBILITY)
                 // =========================================================
-
-                const supplier =
+                // Validate tenant-scoped supplier if present in the database.
+                // Historical purchase returns are permitted even if the supplier
+                // is currently inactive, blocked, or archived/soft-deleted.
+                if (purchase.supplierId) {
                     await Supplier.findOne({
                         _id: purchase.supplierId,
                         tenantId: user.tenantId,
-                        status: "active",
-                        isDeleted: false,
                     }).session(session);
-
-                if (!supplier) {
-                    throw new Error(
-                        "Supplier not found or inactive"
-                    );
                 }
+
+                // Preserve the immutable historical supplier snapshot recorded on the original purchase
+                const returnSupplierSnapshot = purchase.supplierSnapshot || {
+                    name: "Unknown Supplier",
+                    supplierCode: "UNKNOWN",
+                };
 
 
                 // =========================================================
@@ -558,19 +559,19 @@ export class PurchaseReturnService {
                             purchase._id,
 
                         supplierId:
-                            supplier._id,
+                            purchase.supplierId,
 
                         supplierSnapshot: {
-                            name: supplier.name,
+                            name: returnSupplierSnapshot.name,
 
                             supplierCode:
-                                supplier.supplierCode,
+                                returnSupplierSnapshot.supplierCode,
 
                             phone:
-                                supplier.contact?.phone,
+                                returnSupplierSnapshot.phone,
 
                             gstin:
-                                supplier.tax?.gstin,
+                                returnSupplierSnapshot.gstin,
                         },
 
                         returnDate:

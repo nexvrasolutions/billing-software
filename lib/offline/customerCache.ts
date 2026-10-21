@@ -282,10 +282,26 @@ export async function savePendingOfflineCustomer(
     };
 }
 
+const OBJECT_ID_REGEX = /^[a-f\d]{24}$/i;
+
+/**
+ * Validate whether a string is a valid MongoDB ObjectId (24 hex characters).
+ */
+export function isValidServerCustomerId(id: string): boolean {
+    return typeof id === "string" && OBJECT_ID_REGEX.test(id.trim());
+}
+
+/**
+ * Validate whether a string is an offline temporary customer ID (starting with "cust_").
+ */
+export function isTemporaryCustomerId(id: string): boolean {
+    return typeof id === "string" && id.trim().startsWith("cust_");
+}
+
 /**
  * Scan cached customers for any pending records that have not yet been queued in syncQueue,
  * and enqueue them so that reconnecting or SyncManager will process them.
- * This heals any orphaned pending customers created offline (e.g. Vishak).
+ * This heals any orphaned pending customers created or updated offline.
  */
 export async function ensurePendingCustomersQueued(
     tenantId: string,
@@ -316,23 +332,73 @@ export async function ensurePendingCustomersQueued(
     const existingQueueByOpId = new Map(allQueueItems.map((q) => [q.operationId, q]));
 
     for (const cust of pendingOnly) {
-        const opId = cust.operationId || crypto.randomUUID();
-        const existingItem = existingQueueByOpId.get(opId);
+        const isTempId = isTemporaryCustomerId(cust.customerId);
+        const isValidServerId = isValidServerCustomerId(cust.customerId);
+
+        if (!isTempId && !isValidServerId) {
+            console.warn(`[ensurePendingCustomersQueued] Skipping ambiguous customer ID: "${cust.customerId}". Data preserved in cache.`);
+            continue;
+        }
+
+        const isOpIdFromCreate = Boolean(
+            cust.operationId &&
+            allQueueItems.some(
+                (q) =>
+                    q.entityType === "Customer" &&
+                    q.operationType === "CREATE" &&
+                    q.operationId === cust.operationId
+            )
+        );
+
+        const opId = (cust.operationId && (!isValidServerId || !isOpIdFromCreate))
+            ? cust.operationId
+            : crypto.randomUUID();
+
+        // Check if an item exists by opId OR by matching localId / customerId
+        let existingItem = existingQueueByOpId.get(opId);
+        if (existingItem && isValidServerId && existingItem.operationType === "CREATE") {
+            existingItem = undefined;
+        }
+
+        if (!existingItem) {
+            existingItem = allQueueItems.find((q) => {
+                if (q.entityType !== "Customer") return false;
+                if (q.status !== "PENDING" && q.status !== "FAILED") return false;
+                if (isTempId) return q.payload?.localId === cust.customerId;
+                return q.operationType === "UPDATE" && q.payload?.customerId === cust.customerId;
+            });
+            // If found by localId/customerId, align cust.operationId with existingItem.operationId
+            if (existingItem && cust.operationId !== existingItem.operationId) {
+                await db.cachedCustomers.update(cust.id, { operationId: existingItem.operationId });
+            }
+        }
 
         if (!existingItem) {
             const nowIso = new Date().toISOString();
-            await db.syncQueue.add({
-                operationId: opId,
-                operationType: "CREATE",
-                entityType: "Customer",
-                payload: {
+            const operationType = isTempId ? "CREATE" : "UPDATE";
+            const payload = isTempId
+                ? {
                     localId: cust.customerId,
                     name: cust.name,
                     ...(cust.phone ? { phone: cust.phone } : {}),
                     ...(cust.email ? { email: cust.email } : {}),
                     ...(cust.address ? { address: cust.address } : {}),
                     status: cust.status,
-                },
+                }
+                : {
+                    customerId: cust.customerId,
+                    name: cust.name,
+                    ...(cust.phone ? { phone: cust.phone } : {}),
+                    ...(cust.email ? { email: cust.email } : {}),
+                    ...(cust.address ? { address: cust.address } : {}),
+                    status: cust.status,
+                };
+
+            await db.syncQueue.add({
+                operationId: opId,
+                operationType,
+                entityType: "Customer",
+                payload,
                 localSeq: Date.now(),
                 status: "PENDING",
                 attempts: 0,
@@ -375,7 +441,8 @@ export async function savePendingOfflineCustomerUpdate(
     },
     tenantId: string,
     db: OfflineDatabase = offlineDB,
-    operationId?: string
+    operationId?: string,
+    fallbackOwner?: SessionIdentity
 ): Promise<CachedCustomerRecord> {
     const cleanTenantId = tenantId.trim();
     if (!cleanTenantId) {
@@ -392,11 +459,70 @@ export async function savePendingOfflineCustomerUpdate(
         throw new Error("Customer name is required");
     }
 
-    const assignedOpId = operationId || crypto.randomUUID();
-    const nowIso = new Date().toISOString();
+    const isTempId = isTemporaryCustomerId(cleanCustomerId);
+    const isValidServerId = isValidServerCustomerId(cleanCustomerId);
 
+    if (!isTempId && !isValidServerId) {
+        throw new Error(`Ambiguous customer ID format: "${cleanCustomerId}". Cannot determine if customer is local temporary or server record.`);
+    }
+
+    const nowIso = new Date().toISOString();
     const key = makeCachedCustomerId(cleanTenantId, cleanCustomerId);
     const existing = await db.cachedCustomers.get(key);
+
+    let allQueueItems: SyncQueueItem[] = [];
+    if (db.syncQueue) {
+        try {
+            allQueueItems = await db.syncQueue.toArray();
+        } catch {}
+    }
+
+    // Look for existing queue items for this customer
+    let existingQueueItem: SyncQueueItem | undefined;
+    if (isTempId) {
+        existingQueueItem = allQueueItems.find((q) => {
+            if (q.entityType !== "Customer") return false;
+            if (q.status !== "PENDING" && q.status !== "FAILED" && q.status !== "NEEDS_ATTENTION") return false;
+            return q.payload?.localId === cleanCustomerId || (existing?.operationId ? q.operationId === existing.operationId : false);
+        });
+    } else if (isValidServerId) {
+        // Genuine existing UPDATE item for an existing server customer
+        existingQueueItem = allQueueItems.find((q) => {
+            if (q.entityType !== "Customer") return false;
+            if (q.operationType !== "UPDATE") return false;
+            if (q.status !== "PENDING" && q.status !== "FAILED" && q.status !== "NEEDS_ATTENTION") return false;
+            return q.payload?.customerId === cleanCustomerId || (existing?.operationId ? q.operationId === existing.operationId : false);
+        });
+    }
+
+    // Determine whether cached customer's operationId belongs to a CREATE operation
+    const isCachedOpIdFromCreate = Boolean(
+        existing?.operationId &&
+        allQueueItems.some(
+            (q) =>
+                q.entityType === "Customer" &&
+                q.operationType === "CREATE" &&
+                (q.operationId === existing.operationId ||
+                    q.payload?.customerId === cleanCustomerId ||
+                    q.payload?.localId === cleanCustomerId)
+        )
+    );
+
+    // Stable operation ID assignment:
+    // 1. Explicit operationId argument takes priority.
+    // 2. Existing matching queue item preserves its operationId (keeps genuine UPDATE stable across retries).
+    // 3. For an existing server customer whose cached operationId belongs to a failed CREATE, generate a fresh UUID.
+    // 4. Otherwise preserve existing.operationId or generate a fresh UUID.
+    let assignedOpId: string;
+    if (operationId) {
+        assignedOpId = operationId;
+    } else if (existingQueueItem) {
+        assignedOpId = existingQueueItem.operationId;
+    } else if (isValidServerId && isCachedOpIdFromCreate) {
+        assignedOpId = crypto.randomUUID();
+    } else {
+        assignedOpId = existing?.operationId || crypto.randomUUID();
+    }
 
     const record: CachedCustomerRecord = {
         id: key,
@@ -410,29 +536,100 @@ export async function savePendingOfflineCustomerUpdate(
         cachedAt: nowIso,
         syncStatus: "PENDING",
         operationId: assignedOpId,
+        errorMessage: undefined,
     };
 
     await db.cachedCustomers.put(record);
 
-    // If an un-synced queue item exists for this customer, update its payload as well
-    try {
-        const queueItems = await db.syncQueue.toArray();
-        const pendingItem = queueItems.find(
-            (q) => q.entityType === "Customer" && (q.payload?.localId === cleanCustomerId || q.operationId === assignedOpId)
-        );
-        if (pendingItem && pendingItem.id !== undefined && (pendingItem.status === "PENDING" || pendingItem.status === "FAILED")) {
-            await db.syncQueue.update(pendingItem.id, {
-                payload: {
-                    ...pendingItem.payload,
-                    name: cleanName,
-                    phone: record.phone,
-                    email: record.email,
-                    address: record.address,
-                    status: record.status,
-                },
-            });
+    if (db.syncQueue) {
+        try {
+            if (existingQueueItem && existingQueueItem.id !== undefined) {
+                // Update existing queue item
+                await db.syncQueue.update(existingQueueItem.id, {
+                    payload: {
+                        ...existingQueueItem.payload,
+                        ...(isTempId ? { localId: cleanCustomerId } : { customerId: cleanCustomerId }),
+                        name: cleanName,
+                        phone: record.phone,
+                        email: record.email,
+                        address: record.address,
+                        status: record.status,
+                    },
+                    operationId: assignedOpId,
+                    status: "PENDING",
+                    errorMessage: undefined,
+                });
+            } else if (isValidServerId) {
+                // Existing server customer: enqueue a durable Customer / UPDATE operation!
+                let owner: SessionIdentity | undefined = fallbackOwner;
+                if (!owner && db.meta?.get) {
+                    const remembered = await db.meta.get(LAST_IDENTITY_KEY);
+                    if (remembered?.value && typeof remembered.value === "object") {
+                        owner = remembered.value as SessionIdentity;
+                    }
+                }
+                if (!owner && cleanTenantId) {
+                    owner = { tenantId: cleanTenantId, userId: "", deviceId: "" };
+                }
+
+                await db.syncQueue.add({
+                    operationId: assignedOpId,
+                    operationType: "UPDATE",
+                    entityType: "Customer",
+                    payload: {
+                        customerId: cleanCustomerId,
+                        name: cleanName,
+                        ...(record.phone ? { phone: record.phone } : {}),
+                        ...(record.email ? { email: record.email } : {}),
+                        ...(record.address ? { address: record.address } : {}),
+                        status: record.status,
+                    },
+                    localSeq: Date.now(),
+                    status: "PENDING",
+                    attempts: 0,
+                    createdAt: nowIso,
+                    nextAttemptAt: nowIso,
+                    owner,
+                    ownerUserId: owner?.userId || undefined,
+                });
+            } else if (isTempId) {
+                // Temporary local customer whose CREATE item was missing: heal CREATE operation
+                let owner: SessionIdentity | undefined = fallbackOwner;
+                if (!owner && db.meta?.get) {
+                    const remembered = await db.meta.get(LAST_IDENTITY_KEY);
+                    if (remembered?.value && typeof remembered.value === "object") {
+                        owner = remembered.value as SessionIdentity;
+                    }
+                }
+                if (!owner && cleanTenantId) {
+                    owner = { tenantId: cleanTenantId, userId: "", deviceId: "" };
+                }
+
+                await db.syncQueue.add({
+                    operationId: assignedOpId,
+                    operationType: "CREATE",
+                    entityType: "Customer",
+                    payload: {
+                        localId: cleanCustomerId,
+                        name: cleanName,
+                        ...(record.phone ? { phone: record.phone } : {}),
+                        ...(record.email ? { email: record.email } : {}),
+                        ...(record.address ? { address: record.address } : {}),
+                        status: record.status,
+                    },
+                    localSeq: Date.now(),
+                    status: "PENDING",
+                    attempts: 0,
+                    createdAt: nowIso,
+                    nextAttemptAt: nowIso,
+                    owner,
+                    ownerUserId: owner?.userId,
+                });
+            }
+        } catch (queueErr) {
+            console.warn("Could not enqueue or update customer in syncQueue:", queueErr);
         }
-    } catch {}
+    }
 
     return record;
 }

@@ -356,11 +356,12 @@ PurchaseSchema.index(
     }
 );
 
-// Each offline operation can be processed only once
+// Each offline or online operation can be processed only once
 // inside a tenant.
 //
-// Partial unique index allows normal online purchases
-// that do not have an operationId.
+// Partial unique index indexes only non-empty string operationIds,
+// safely allowing normal purchases without an operationId,
+// empty strings, or legacy records with null.
 PurchaseSchema.index(
     {
         tenantId: 1,
@@ -369,9 +370,7 @@ PurchaseSchema.index(
     {
         unique: true,
         partialFilterExpression: {
-            operationId: {
-                $exists: true,
-            },
+            operationId: { $type: "string", $gt: "" },
         },
     }
 );

@@ -4,6 +4,9 @@ import mongoose from "mongoose";
 import { connectDB, isDatabaseConnectionError } from "@/lib/db/mongodb";
 import { Customer } from "@/lib/models/Customer";
 import { getAuthenticatedContext } from "@/lib/auth/getAuthenticatedContext";
+import { getGrantedPermissions } from "@/lib/auth/hasPermission";
+import { createCustomerSchema, CUSTOMER_WRITE_PERMISSIONS } from "@/lib/validations/customer";
+import { AuditLogService } from "@/lib/services/AuditLogService";
 
 export async function GET(request: NextRequest) {
     try {
@@ -79,42 +82,99 @@ export async function POST(request: NextRequest) {
             );
         }
 
-        const body = await request.json();
-        const name = typeof body.name === "string" ? body.name.trim() : "";
-        if (!name) {
+        // Verify role authorization when roleId is present
+        if (auth.roleId) {
+            const granted = await getGrantedPermissions({
+                userId: auth.userId,
+                tenantId: auth.tenantId,
+                roleId: auth.roleId,
+                permissions: CUSTOMER_WRITE_PERMISSIONS,
+            });
+
+            if (granted.size === 0) {
+                return NextResponse.json(
+                    { success: false, message: "You do not have permission to create customers" },
+                    { status: 403 }
+                );
+            }
+        }
+
+        let body: unknown;
+        try {
+            body = await request.json();
+        } catch {
             return NextResponse.json(
-                { success: false, message: "Name is required" },
+                { success: false, message: "Invalid JSON request body" },
                 { status: 400 }
             );
         }
 
-        if (name.length > 200) {
+        const parsed = createCustomerSchema.safeParse(body);
+        if (!parsed.success) {
             return NextResponse.json(
-                { success: false, message: "Customer name cannot exceed 200 characters" },
+                {
+                    success: false,
+                    message: parsed.error.issues[0]?.message || "Invalid customer data",
+                    errors: parsed.error.issues.map((issue) => ({
+                        field: issue.path.join("."),
+                        message: issue.message,
+                    })),
+                },
                 { status: 400 }
             );
         }
 
-        const phone = typeof body.phone === "string" && body.phone.trim().length > 0
-            ? body.phone.trim()
-            : undefined;
-        const email = typeof body.email === "string" && body.email.trim().length > 0
-            ? body.email.trim().toLowerCase()
-            : undefined;
-        const address = typeof body.address === "string" && body.address.trim().length > 0
-            ? body.address.trim()
-            : undefined;
-        const status = body.status === "inactive" ? "inactive" : "active";
+        const { name, phone, email, address, status, operationId } = parsed.data;
 
         await connectDB();
+        const tenantId = new mongoose.Types.ObjectId(auth.tenantId);
+
+        // Pre-check for duplicate phone in this tenant
+        if (phone) {
+            const duplicate = await Customer.findOne({
+                tenantId,
+                phone,
+            }).select("_id").lean();
+
+            if (duplicate) {
+                return NextResponse.json(
+                    { success: false, message: "A customer with this phone number already exists." },
+                    { status: 409 }
+                );
+            }
+        }
+
         const customer = await Customer.create({
-            tenantId: new mongoose.Types.ObjectId(auth.tenantId),
+            tenantId,
             name,
             ...(phone ? { phone } : {}),
             ...(email ? { email } : {}),
             ...(address ? { address } : {}),
             status,
+            ...(operationId ? { operationId } : {}),
         });
+
+        await AuditLogService.createAuditLog(
+            {
+                userId: new mongoose.Types.ObjectId(auth.userId),
+                tenantId,
+                deviceId: auth.deviceId ? new mongoose.Types.ObjectId(auth.deviceId) : undefined,
+            },
+            {
+                action: "CREATE",
+                entity: "Customer",
+                entityId: customer._id,
+                description: `Customer ${customer.name} created`,
+                newValues: {
+                    name: customer.name,
+                    phone: customer.phone,
+                    email: customer.email,
+                    address: customer.address,
+                    status: customer.status,
+                    ...(operationId ? { operationId } : {}),
+                },
+            }
+        );
 
         return NextResponse.json(
             {
@@ -138,7 +198,7 @@ export async function POST(request: NextRequest) {
                 success: false,
                 message: error.code === 11000 ? "A customer with this phone number already exists." : "Failed to create customer",
             },
-            { status: 400 }
+            { status: error.code === 11000 ? 409 : 400 }
         );
     }
 }

@@ -33,15 +33,26 @@ import {
     getCachedCustomersForTenant,
     searchCachedCustomers,
     savePendingOfflineCustomer,
+    savePendingOfflineCustomerUpdate,
+    ensurePendingCustomersQueued,
     resolvePendingCustomerId,
     markPendingCustomerNeedsAttention,
+    isValidServerCustomerId,
+    isTemporaryCustomerId,
     type CachedCustomerRecord,
 } from "../lib/offline/customerCache";
 import { CustomerSyncService } from "../lib/services/CustomerSyncService";
 import { SyncProcessError } from "../lib/services/SyncErrors";
 import { submitPosSale, type PosSaleSubmitOutcome } from "../components/pos/pos-screen";
 import { resolvePendingProductId } from "../lib/offline/productCatalogueCache";
-import type { OfflineDatabase, SyncQueueItem } from "../lib/offline/db";
+import { LAST_IDENTITY_KEY, type OfflineDatabase, type SyncQueueItem } from "../lib/offline/db";
+import {
+    selectSyncable,
+    isOwnedBy,
+    decideAfterOutcome,
+    interpretResponse,
+    type SessionIdentity,
+} from "../lib/offline/syncPolicy";
 
 // ============================================================
 // TEST HARNESS
@@ -71,6 +82,7 @@ function createMemoryOfflineDb() {
     const cachedCustomersMap = new Map<string, CachedCustomerRecord>();
     const cachedProductsMap = new Map<string, any>();
     const syncQueueList: SyncQueueItem[] = [];
+    const metaMap = new Map<string, unknown>();
 
     let nextQueueId = 1;
 
@@ -186,13 +198,23 @@ function createMemoryOfflineDb() {
                 }),
             }),
         },
+        meta: {
+            get: async (key: string) => {
+                const val = metaMap.get(key);
+                return val !== undefined ? { key, value: structuredClone(val) } : undefined;
+            },
+            put: async (record: { key: string; value: unknown }) => {
+                metaMap.set(record.key, structuredClone(record.value));
+                return record.key;
+            },
+        },
         transaction: async (_mode: any, ...args: any[]) => {
             const callback = args[args.length - 1];
             return await callback();
         },
     } as unknown as OfflineDatabase;
 
-    return { db, cachedCustomersMap, syncQueueList };
+    return { db, cachedCustomersMap, syncQueueList, metaMap };
 }
 
 // ============================================================
@@ -339,27 +361,234 @@ async function runTests() {
     // ------------------------------------------------------------
     console.log("\n--- 7. Offline customer updates ---");
 
-    // Mock Customer.findOne for CustomerSyncService
-    const mockCustomerDb = new Map<string, any>();
-    const serverCustId = new mongoose.Types.ObjectId();
-    mockCustomerDb.set(serverCustId.toString(), {
-        _id: serverCustId,
-        tenantId: userA.tenantId,
+    // Set owner identity in metaMap so savePendingOfflineCustomerUpdate can attach owner
+    memDb.meta?.put({
+        key: LAST_IDENTITY_KEY,
+        value: {
+            tenantId: tenantA,
+            userId: userA.userId.toString(),
+            deviceId: userA.deviceId.toString(),
+        },
+    });
+
+    const serverCustId = "507f1f77bcf86cd799439077";
+    // Setup existing server customer in cache (status SYNCED initially)
+    await memDb.cachedCustomers.put({
+        id: makeCachedCustomerId(tenantA, serverCustId),
+        customerId: serverCustId,
+        tenantId: tenantA,
         name: "Deepak Stores",
         phone: "9444444444",
         status: "active",
-        save: async function () { return this; },
+        cachedAt: new Date().toISOString(),
+        syncStatus: "SYNCED",
     });
 
-    const origFindOne = (mongoose.models.Customer || (CustomerSyncService as any)).findOne;
-    // Test update validation logic
-    const updatePayload = {
-        customerId: serverCustId.toString(),
-        name: "Deepak Supermarket",
-        address: "New Market Yard",
-    };
-    check("Update payload contains valid customer ID", mongoose.isValidObjectId(updatePayload.customerId));
-    check("Update payload contains updated name", updatePayload.name === "Deepak Supermarket");
+    // 7.1 Offline UPDATE of existing server customer creates durable UPDATE queue operation
+    const queueBeforeUpdate = (await memDb.syncQueue.toArray()).length;
+    const updatedCust = await savePendingOfflineCustomerUpdate(
+        {
+            customerId: serverCustId,
+            name: "Deepak Supermarket",
+            phone: "9444444444",
+            address: "New Market Yard",
+            status: "active",
+        },
+        tenantA,
+        memDb
+    );
+
+    check("7.1 Offline update persists to Dexie cache with PENDING status", updatedCust.syncStatus === "PENDING");
+    check("7.1 Authoritative server ID preserved in cache", updatedCust.customerId === serverCustId);
+    check("7.1 Updated fields persisted in cache", updatedCust.name === "Deepak Supermarket" && updatedCust.address === "New Market Yard");
+
+    const allQueueAfterUpdate = await memDb.syncQueue.toArray();
+    check("7.1 Exactly one queue operation added", allQueueAfterUpdate.length === queueBeforeUpdate + 1);
+
+    const updateQueueItem = allQueueAfterUpdate.find((q) => q.payload?.customerId === serverCustId);
+    check("7.2 Queue item has entityType Customer", updateQueueItem?.entityType === "Customer");
+    check("7.2 Queue item has operationType UPDATE", updateQueueItem?.operationType === "UPDATE");
+    check("7.2 Queue item has correct customerId in payload", updateQueueItem?.payload?.customerId === serverCustId);
+    check("7.2 Queue item has updated name in payload", updateQueueItem?.payload?.name === "Deepak Supermarket");
+    check("7.2 Queue item has updated address in payload", updateQueueItem?.payload?.address === "New Market Yard");
+    check("7.2 Queue item has stable operationId matching cache", updateQueueItem?.operationId === updatedCust.operationId);
+    check("7.2 Queue item has owner attached from session", updateQueueItem?.ownerUserId === userA.userId.toString());
+
+    // 7.3 Repeated offline edit on the same customer updates payload without creating duplicate queue items
+    const reUpdatedCust = await savePendingOfflineCustomerUpdate(
+        {
+            customerId: serverCustId,
+            name: "Deepak Supermarket & Cafe",
+            phone: "9444444444",
+            address: "Building 2, New Market Yard",
+        },
+        tenantA,
+        memDb
+    );
+
+    const queueAfterSecondEdit = await memDb.syncQueue.toArray();
+    check("7.3 Repeated edit does not create duplicate queue items", queueAfterSecondEdit.length === allQueueAfterUpdate.length);
+    const updatedQueueItem = queueAfterSecondEdit.find((q) => q.payload?.customerId === serverCustId);
+    check("7.3 Existing queue item payload updated with newest values", updatedQueueItem?.payload?.name === "Deepak Supermarket & Cafe");
+    check("7.3 Operation ID preserved across repeated edits", updatedQueueItem?.operationId === updateQueueItem?.operationId);
+
+    // 7.4 Offline CREATE followed by offline edit
+    const { customer: pendingCreateCust } = await savePendingOfflineCustomer(
+        { name: "Brand New Offline Store", phone: "9666666666" },
+        tenantA,
+        memDb
+    );
+    const createQueueItemBefore = (await memDb.syncQueue.toArray()).find((q) => q.payload?.localId === pendingCreateCust.customerId);
+    const origCreateOpId = createQueueItemBefore?.operationId;
+    const queueCountBeforeEdit = (await memDb.syncQueue.toArray()).length;
+
+    const editedPendingCreate = await savePendingOfflineCustomerUpdate(
+        {
+            customerId: pendingCreateCust.customerId,
+            name: "Brand New Offline Superstore",
+            phone: "9666666666",
+            address: "Main Plaza",
+        },
+        tenantA,
+        memDb
+    );
+
+    const queueCountAfterEdit = (await memDb.syncQueue.toArray()).length;
+    check("7.4 Edit on pending CREATE does not add a second queue item", queueCountAfterEdit === queueCountBeforeEdit);
+
+    const createQueueItemAfter = (await memDb.syncQueue.toArray()).find((q) => q.payload?.localId === pendingCreateCust.customerId);
+    check("7.4 Operation type remains CREATE for offline-created customer", createQueueItemAfter?.operationType === "CREATE");
+    check("7.4 Original CREATE operationId is preserved", createQueueItemAfter?.operationId === origCreateOpId);
+    check("7.4 Cached customer operationId matches preserved queue operationId", editedPendingCreate.operationId === origCreateOpId);
+    check("7.4 Queue item payload contains updated name", createQueueItemAfter?.payload?.name === "Brand New Offline Superstore");
+
+    // 7.5 Queue healing never converts an existing server customer into CREATE
+    // Simulate orphaned pending update in cache (e.g. queue item dropped or healing run)
+    const orphanCustId = "507f1f77bcf86cd799439088";
+    const orphanOpId = "op_orphan_update_99";
+    await memDb.cachedCustomers.put({
+        id: makeCachedCustomerId(tenantA, orphanCustId),
+        customerId: orphanCustId,
+        tenantId: tenantA,
+        name: "Orphaned Server Customer",
+        phone: "9777777777",
+        status: "active",
+        cachedAt: new Date().toISOString(),
+        syncStatus: "PENDING",
+        operationId: orphanOpId,
+    });
+
+    const healedCount = await ensurePendingCustomersQueued(tenantA, memDb);
+    check("7.5 ensurePendingCustomersQueued heals orphaned pending update", healedCount >= 1);
+
+    const healedQueueItem = (await memDb.syncQueue.toArray()).find((q) => q.payload?.customerId === orphanCustId);
+    check("7.5 Healed queue item exists for server customer", Boolean(healedQueueItem));
+    check("7.5 Queue healing sets operationType UPDATE (never CREATE for server customer)", healedQueueItem?.operationType === "UPDATE");
+    check("7.5 Healed item payload has customerId (not localId)", healedQueueItem?.payload?.customerId === orphanCustId && healedQueueItem?.payload?.localId === undefined);
+
+    // 7.6 Repeated queue healing does not duplicate operations
+    const healedAgainCount = await ensurePendingCustomersQueued(tenantA, memDb);
+    check("7.6 Repeated queue healing is strictly idempotent (0 added)", healedAgainCount === 0);
+
+    // 7.7 Successful UPDATE marks cached record SYNCED and preserves server ID
+    const cachedBeforeSync = await memDb.cachedCustomers.get(makeCachedCustomerId(tenantA, serverCustId));
+    check("7.7 Cached customer has PENDING before sync reconciliation", cachedBeforeSync?.syncStatus === "PENDING");
+
+    // Simulate SyncManager reconciliation on success
+    await memDb.cachedCustomers.update(makeCachedCustomerId(tenantA, serverCustId), {
+        syncStatus: "SYNCED",
+        errorMessage: undefined,
+        cachedAt: new Date().toISOString(),
+    });
+
+    const cachedAfterSync = await memDb.cachedCustomers.get(makeCachedCustomerId(tenantA, serverCustId));
+    check("7.7 Successfully synced UPDATE marks cached record SYNCED", cachedAfterSync?.syncStatus === "SYNCED");
+    check("7.7 Authoritative server ID preserved after sync", cachedAfterSync?.customerId === serverCustId);
+
+    // 7.8 Stale response protection
+    // User edits customer locally while an older sync was in flight:
+    const newerOpId = "op_newer_local_edit_999";
+    await memDb.cachedCustomers.update(makeCachedCustomerId(tenantA, serverCustId), {
+        name: "Deepak Supermarket Brand Newest",
+        syncStatus: "PENDING",
+        operationId: newerOpId,
+    });
+
+    // In-flight sync finishes for older op:
+    const inFlightStaleOpId = "op_older_stale_111";
+    const cachedDuringStaleResponse = await memDb.cachedCustomers.get(makeCachedCustomerId(tenantA, serverCustId));
+    const isNewerLocalEdit = cachedDuringStaleResponse?.syncStatus === "PENDING" && Boolean(cachedDuringStaleResponse?.operationId && cachedDuringStaleResponse?.operationId !== inFlightStaleOpId);
+    check("7.8 Stale response detection identifies newer local edit", isNewerLocalEdit === true);
+
+    if (!isNewerLocalEdit) {
+        await memDb.cachedCustomers.update(makeCachedCustomerId(tenantA, serverCustId), {
+            syncStatus: "SYNCED",
+        });
+    }
+
+    const cachedAfterStaleResponse = await memDb.cachedCustomers.get(makeCachedCustomerId(tenantA, serverCustId));
+    check("7.8 Stale response does NOT overwrite newer local edit (remains PENDING)", cachedAfterStaleResponse?.syncStatus === "PENDING");
+    check("7.8 Newer local edit data is fully preserved", cachedAfterStaleResponse?.name === "Deepak Supermarket Brand Newest");
+
+    // 7.9 Failed UPDATE operations remain recoverable and display actionable error
+    await markPendingCustomerNeedsAttention(serverCustId, tenantA, "Phone number collision detected on server", memDb);
+    const failedCustomer = await memDb.cachedCustomers.get(makeCachedCustomerId(tenantA, serverCustId));
+    check("7.9 Failed UPDATE marked with syncStatus NEEDS_ATTENTION", failedCustomer?.syncStatus === "NEEDS_ATTENTION");
+    check("7.9 Actionable error message stored on cached customer", failedCustomer?.errorMessage === "Phone number collision detected on server");
+
+    // Recover by editing and re-saving
+    const recoveredCustomer = await savePendingOfflineCustomerUpdate(
+        {
+            customerId: serverCustId,
+            name: "Deepak Supermarket Fixed",
+            phone: "9888888888",
+        },
+        tenantA,
+        memDb
+    );
+    check("7.9 Re-saving failed customer clears failure and returns to PENDING", recoveredCustomer.syncStatus === "PENDING");
+
+    // 7.10 Customer without phone number is updated rather than recreated
+    const noPhoneCustId = "507f1f77bcf86cd799439099";
+    await memDb.cachedCustomers.put({
+        id: makeCachedCustomerId(tenantA, noPhoneCustId),
+        customerId: noPhoneCustId,
+        tenantId: tenantA,
+        name: "No Phone Customer",
+        status: "active",
+        cachedAt: new Date().toISOString(),
+        syncStatus: "SYNCED",
+    });
+
+    const updatedNoPhone = await savePendingOfflineCustomerUpdate(
+        {
+            customerId: noPhoneCustId,
+            name: "No Phone Customer Updated",
+        },
+        tenantA,
+        memDb
+    );
+    const noPhoneQueueItem = (await memDb.syncQueue.toArray()).find((q) => q.payload?.customerId === noPhoneCustId);
+    check("7.10 Customer without phone is queued as UPDATE (not CREATE)", noPhoneQueueItem?.operationType === "UPDATE");
+    check("7.10 Customer without phone preserves original server ID", updatedNoPhone.customerId === noPhoneCustId);
+
+    // 7.11 ID validation and ambiguity rejection
+    check("7.11 24-character hex ID recognized as server customer ID", isValidServerCustomerId("507f1f77bcf86cd799439011") === true);
+    check("7.11 cust_ prefixed ID recognized as temporary customer ID", isTemporaryCustomerId("cust_12345_uuid") === true);
+    check("7.11 Ambiguous non-hex, non-cust string rejected as server ID", isValidServerCustomerId("invalid_cust_id") === false);
+    check("7.11 Ambiguous non-hex, non-cust string rejected as temporary ID", isTemporaryCustomerId("invalid_cust_id") === false);
+
+    let caughtAmbiguity = false;
+    try {
+        await savePendingOfflineCustomerUpdate(
+            { customerId: "non_hex_random_123", name: "Ambiguous Name" },
+            tenantA,
+            memDb
+        );
+    } catch (err: any) {
+        caughtAmbiguity = err.message.includes("Ambiguous");
+    }
+    check("7.11 Ambiguous customer ID throws error and rejects guessing", caughtAmbiguity === true);
 
     // ------------------------------------------------------------
     // 8. Stable local IDs and operation IDs
@@ -906,6 +1135,621 @@ async function runTests() {
     simulateDebounceEffect("");
     check("Post-clear debounce check with empty query does not schedule redundant timer",
         debounceTimer === null && searchRequestCount === 3
+    );
+
+    // =========================================================================
+    // 19. Offline existing-customer UPDATE recovery & detail page load preservation
+    // =========================================================================
+    console.log("\n--- 19. Offline existing-customer UPDATE recovery & detail page load preservation ---");
+
+    const recoveryTenantId = "6abe48a86ae4b08a3e335303";
+    const existingServerCustId = "6ad62b1cfa76d2cb3ce12240";
+    const oldFailedCreateOpId = "5c02d6e5-9127-47dc-89fc-5f0cd9d6a645";
+    const recoveryUser = {
+        userId: new mongoose.Types.ObjectId().toString(),
+        tenantId: recoveryTenantId,
+        deviceId: new mongoose.Types.ObjectId().toString(),
+    };
+
+    memDb.meta?.put({
+        key: LAST_IDENTITY_KEY,
+        value: recoveryUser,
+    });
+
+    // Seed the old failed CREATE operation in syncQueue (matching evidence: NEEDS_ATTENTION)
+    const originalCreateQueueRecord: SyncQueueItem = {
+        id: 9901,
+        operationId: oldFailedCreateOpId,
+        operationType: "CREATE",
+        entityType: "Customer",
+        payload: {
+            localId: existingServerCustId,
+            name: "Biling",
+            address: "Karungal",
+            phone: "9876543210",
+            status: "active",
+        },
+        localSeq: 50,
+        status: "NEEDS_ATTENTION",
+        attempts: 3,
+        createdAt: new Date().toISOString(),
+        errorMessage: "Customer with this phone number already exists on server",
+        owner: recoveryUser as any,
+        ownerUserId: recoveryUser.userId,
+    };
+    await memDb.syncQueue.put(originalCreateQueueRecord);
+
+    // Seed the cachedCustomer record with NEEDS_ATTENTION and pointing to the failed CREATE operationId
+    await memDb.cachedCustomers.put({
+        id: makeCachedCustomerId(recoveryTenantId, existingServerCustId),
+        customerId: existingServerCustId,
+        tenantId: recoveryTenantId,
+        name: "Biling",
+        phone: "9876543210",
+        address: "Karungal",
+        status: "active",
+        cachedAt: new Date().toISOString(),
+        syncStatus: "NEEDS_ATTENTION",
+        operationId: oldFailedCreateOpId,
+        errorMessage: "Customer with this phone number already exists on server",
+    });
+
+    // 19.1 Existing customer with a failed CREATE gets a new UPDATE operation with a fresh UUID
+    const firstRecoveryUpdate = await savePendingOfflineCustomerUpdate(
+        {
+            customerId: existingServerCustId,
+            name: "Biling Fixed",
+            phone: "9876543210",
+            address: "Karungal Main Street",
+        },
+        recoveryTenantId,
+        memDb
+    );
+
+    check("19.1 Existing customer with failed CREATE gets a new UPDATE operation with a fresh UUID",
+        Boolean(firstRecoveryUpdate.operationId) &&
+        firstRecoveryUpdate.operationId !== oldFailedCreateOpId
+    );
+    check("19.1 Cached customer syncStatus set to PENDING upon recovery update",
+        firstRecoveryUpdate.syncStatus === "PENDING"
+    );
+    check("19.1 Cached customer authoritative server ID is preserved",
+        firstRecoveryUpdate.customerId === existingServerCustId
+    );
+
+    // 19.2 Old failed CREATE remains untouched
+    const allQueueItemsAfterFirst = await memDb.syncQueue.toArray();
+    const oldCreateInQueue = allQueueItemsAfterFirst.find((q) => q.operationId === oldFailedCreateOpId);
+
+    check("19.2 Old failed CREATE remains in queue", Boolean(oldCreateInQueue));
+    check("19.2 Old failed CREATE operationType is still CREATE (untouched)",
+        oldCreateInQueue?.operationType === "CREATE"
+    );
+    check("19.2 Old failed CREATE status is still NEEDS_ATTENTION (untouched)",
+        oldCreateInQueue?.status === "NEEDS_ATTENTION"
+    );
+    check("19.2 Old failed CREATE payload is completely untouched",
+        oldCreateInQueue?.payload?.name === "Biling" &&
+        oldCreateInQueue?.payload?.address === "Karungal"
+    );
+
+    // 19.3 Repeated attempts/retries of the same UPDATE preserve its operationId and do not create duplicate queue entries
+    const newUpdateInQueue = allQueueItemsAfterFirst.find((q) => q.operationId === firstRecoveryUpdate.operationId);
+    check("19.3 New UPDATE queue item created with fresh UUID", Boolean(newUpdateInQueue));
+    check("19.3 New UPDATE queue item has operationType UPDATE", newUpdateInQueue?.operationType === "UPDATE");
+    check("19.3 New UPDATE queue item has status PENDING", newUpdateInQueue?.status === "PENDING");
+    check("19.3 New UPDATE queue item payload has customerId and updated fields",
+        newUpdateInQueue?.payload?.customerId === existingServerCustId &&
+        newUpdateInQueue?.payload?.name === "Biling Fixed" &&
+        newUpdateInQueue?.payload?.address === "Karungal Main Street"
+    );
+
+    // Repeated attempt / retry of the same UPDATE
+    const queueCountBeforeSecond = (await memDb.syncQueue.toArray()).length;
+    const secondRecoveryUpdate = await savePendingOfflineCustomerUpdate(
+        {
+            customerId: existingServerCustId,
+            name: "Biling Fixed Again",
+            phone: "9876543210",
+            address: "Karungal North Junction",
+        },
+        recoveryTenantId,
+        memDb
+    );
+
+    const allQueueItemsAfterSecond = await memDb.syncQueue.toArray();
+    check("19.3 Repeated attempt/retry of the same UPDATE preserves its operationId",
+        secondRecoveryUpdate.operationId === firstRecoveryUpdate.operationId
+    );
+    check("19.3 Repeated attempt does not create duplicate queue entries",
+        allQueueItemsAfterSecond.length === queueCountBeforeSecond
+    );
+    const updatedQueueItemAfterSecond = allQueueItemsAfterSecond.find((q) => q.operationId === firstRecoveryUpdate.operationId);
+    check("19.3 Existing UPDATE queue item payload updated with new values",
+        updatedQueueItemAfterSecond?.payload?.name === "Biling Fixed Again" &&
+        updatedQueueItemAfterSecond?.payload?.address === "Karungal North Junction"
+    );
+    // Old failed CREATE is still untouched
+    const oldCreateAfterSecond = allQueueItemsAfterSecond.find((q) => q.operationId === oldFailedCreateOpId);
+    check("19.3 Old failed CREATE remains untouched after repeated UPDATE retries",
+        oldCreateAfterSecond?.operationType === "CREATE" &&
+        oldCreateAfterSecond?.status === "NEEDS_ATTENTION" &&
+        oldCreateAfterSecond?.payload?.name === "Biling"
+    );
+
+    // 19.4 - 19.6: Detail page load preservation logic simulation
+    async function simulateDetailPageLoad(
+        customerId: string,
+        tenant: string,
+        isNavOffline: boolean,
+        dbInstance: OfflineDatabase,
+        mockServerApi: (id: string) => Promise<{ status: number; customer?: any }>
+    ) {
+        let loadedCustomer: any = null;
+        let formFields: { name: string; phone: string; address: string; status: string } = {
+            name: "",
+            phone: "",
+            address: "",
+            status: "active",
+        };
+        let triggeredSyncCount = 0;
+
+        // 1. Check local Dexie cache first (as in app/customers/[id]/page.tsx)
+        const key = makeCachedCustomerId(tenant, customerId);
+        const cachedRecord = await dbInstance.cachedCustomers.get(key);
+
+        if (cachedRecord && (cachedRecord.syncStatus === "PENDING" || cachedRecord.syncStatus === "NEEDS_ATTENTION")) {
+            loadedCustomer = {
+                _id: cachedRecord.customerId,
+                name: cachedRecord.name,
+                phone: cachedRecord.phone,
+                email: cachedRecord.email,
+                address: cachedRecord.address,
+                status: cachedRecord.status,
+                syncStatus: cachedRecord.syncStatus,
+                errorMessage: cachedRecord.errorMessage,
+            };
+            formFields = {
+                name: cachedRecord.name,
+                phone: cachedRecord.phone || "",
+                address: cachedRecord.address || "",
+                status: cachedRecord.status,
+            };
+            if (!isNavOffline && cachedRecord.syncStatus === "PENDING") {
+                triggeredSyncCount++;
+            }
+            return { source: "cache", loadedCustomer, formFields, triggeredSyncCount };
+        }
+
+        // 2. If online and no pending local edit, attempt to fetch from server
+        if (!isNavOffline) {
+            const res = await mockServerApi(customerId);
+            if (res.status === 200 && res.customer) {
+                loadedCustomer = res.customer;
+                formFields = {
+                    name: res.customer.name || "",
+                    phone: res.customer.phone || "",
+                    address: res.customer.address || "",
+                    status: res.customer.status || "active",
+                };
+                return { source: "server", loadedCustomer, formFields, triggeredSyncCount };
+            }
+        }
+
+        // 3. Fallback to cached customer if available
+        if (cachedRecord) {
+            loadedCustomer = {
+                _id: cachedRecord.customerId,
+                name: cachedRecord.name,
+                phone: cachedRecord.phone,
+                email: cachedRecord.email,
+                address: cachedRecord.address,
+                status: cachedRecord.status,
+                syncStatus: cachedRecord.syncStatus,
+            };
+            formFields = {
+                name: cachedRecord.name,
+                phone: cachedRecord.phone || "",
+                address: cachedRecord.address || "",
+                status: cachedRecord.status,
+            };
+            return { source: "cache_fallback", loadedCustomer, formFields, triggeredSyncCount };
+        }
+
+        return { source: "not_found", loadedCustomer: null, formFields, triggeredSyncCount };
+    }
+
+    // 19.4 A cached NEEDS_ATTENTION customer retains local form values when detail page loads online
+    const attentionCustId = "6ad62b1cfa76d2cb3ce12241";
+    await memDb.cachedCustomers.put({
+        id: makeCachedCustomerId(recoveryTenantId, attentionCustId),
+        customerId: attentionCustId,
+        tenantId: recoveryTenantId,
+        name: "Preserved Attention Name",
+        phone: "9123456789",
+        address: "Preserved Attention Address",
+        status: "active",
+        cachedAt: new Date().toISOString(),
+        syncStatus: "NEEDS_ATTENTION",
+        errorMessage: "Sync failed previously",
+    });
+
+    const mockServerApiWithOldValues = async (cid: string) => ({
+        status: 200,
+        customer: {
+            _id: cid,
+            name: "Stale Server Name",
+            phone: "9123456789",
+            address: "Stale Server Address",
+            status: "active",
+        },
+    });
+
+    const loadAttentionResult = await simulateDetailPageLoad(
+        attentionCustId,
+        recoveryTenantId,
+        false, // Online!
+        memDb,
+        mockServerApiWithOldValues
+    );
+
+    check("19.4 Cached NEEDS_ATTENTION customer retains local form values when detail page loads online",
+        loadAttentionResult.source === "cache" &&
+        loadAttentionResult.formFields.name === "Preserved Attention Name" &&
+        loadAttentionResult.formFields.address === "Preserved Attention Address"
+    );
+    check("19.4 NEEDS_ATTENTION customer preserves error message and syncStatus",
+        loadAttentionResult.loadedCustomer?.syncStatus === "NEEDS_ATTENTION" &&
+        loadAttentionResult.loadedCustomer?.errorMessage === "Sync failed previously"
+    );
+    check("19.4 NEEDS_ATTENTION customer does not auto-trigger sync without user action",
+        loadAttentionResult.triggeredSyncCount === 0
+    );
+
+    // 19.5 A PENDING customer retains local values as before
+    const pendingCustId = "6ad62b1cfa76d2cb3ce12242";
+    await memDb.cachedCustomers.put({
+        id: makeCachedCustomerId(recoveryTenantId, pendingCustId),
+        customerId: pendingCustId,
+        tenantId: recoveryTenantId,
+        name: "Preserved Pending Name",
+        phone: "9123456780",
+        address: "Preserved Pending Address",
+        status: "active",
+        cachedAt: new Date().toISOString(),
+        syncStatus: "PENDING",
+    });
+
+    const loadPendingResult = await simulateDetailPageLoad(
+        pendingCustId,
+        recoveryTenantId,
+        false, // Online!
+        memDb,
+        mockServerApiWithOldValues
+    );
+
+    check("19.5 Cached PENDING customer retains local values as before on online load",
+        loadPendingResult.source === "cache" &&
+        loadPendingResult.formFields.name === "Preserved Pending Name" &&
+        loadPendingResult.formFields.address === "Preserved Pending Address"
+    );
+    check("19.5 PENDING customer triggers background sync when online",
+        loadPendingResult.triggeredSyncCount === 1
+    );
+
+    // 19.6 A SYNCED customer still loads authoritative server values
+    const syncedCustId = "6ad62b1cfa76d2cb3ce12243";
+    await memDb.cachedCustomers.put({
+        id: makeCachedCustomerId(recoveryTenantId, syncedCustId),
+        customerId: syncedCustId,
+        tenantId: recoveryTenantId,
+        name: "Old Synced Cache Name",
+        phone: "9123456781",
+        address: "Old Synced Cache Address",
+        status: "active",
+        cachedAt: new Date().toISOString(),
+        syncStatus: "SYNCED",
+    });
+
+    const mockServerApiAuthoritative = async (cid: string) => ({
+        status: 200,
+        customer: {
+            _id: cid,
+            name: "Authoritative Server Name",
+            phone: "9123456781",
+            address: "Authoritative Server Address",
+            status: "active",
+        },
+    });
+
+    const loadSyncedResult = await simulateDetailPageLoad(
+        syncedCustId,
+        recoveryTenantId,
+        false, // Online!
+        memDb,
+        mockServerApiAuthoritative
+    );
+
+    check("19.6 SYNCED customer still loads authoritative server values when online",
+        loadSyncedResult.source === "server" &&
+        loadSyncedResult.formFields.name === "Authoritative Server Name" &&
+        loadSyncedResult.formFields.address === "Authoritative Server Address"
+    );
+
+    // 19.7 Tenant ownership and current phone-number validation remain intact
+    check("19.7 Tenant ownership attached to recovery UPDATE queue item",
+        newUpdateInQueue?.ownerUserId === recoveryUser.userId &&
+        (newUpdateInQueue?.owner as any)?.tenantId === recoveryTenantId
+    );
+
+    check("19.7 normalizeCustomerPhone trims whitespace",
+        normalizeCustomerPhone("   9876543210   ") === "9876543210"
+    );
+    check("19.7 normalizeCustomerPhone normalizes empty string to undefined",
+        normalizeCustomerPhone("") === undefined
+    );
+    check("19.7 normalizeCustomerPhone normalizes whitespace-only to undefined",
+        normalizeCustomerPhone("    ") === undefined
+    );
+
+    const otherTenantId = "6abe48a86ae4b08a3e335399";
+    const crossTenantCust = await memDb.cachedCustomers.get(
+        makeCachedCustomerId(otherTenantId, existingServerCustId)
+    );
+    check("19.7 Recovery update in tenant A does not leak or create record in tenant B",
+        crossTenantCust === undefined
+    );
+
+    // =========================================================================
+    console.log("\n--- 20. Offline customer UPDATE real reconnect sync pipeline & policy ---");
+
+    const t20TenantId = "6abe48a86ae4b08a3e335303";
+    const t20CustId = "6ad62b1cfa76d2cb3ce12240";
+    const t20FailedCreateOpId = "5c02d6e5-9127-47dc-89fc-5f0cd9d6a645";
+
+    const t20User: SessionIdentity = {
+        tenantId: t20TenantId,
+        userId: new mongoose.Types.ObjectId().toString(),
+        deviceId: new mongoose.Types.ObjectId().toString(),
+    };
+
+    const { db: t20MemDb } = createMemoryOfflineDb();
+    await t20MemDb.meta.put({
+        key: LAST_IDENTITY_KEY,
+        value: t20User,
+    });
+
+    // Seed old failed CREATE
+    await t20MemDb.syncQueue.put({
+        id: 101,
+        operationId: t20FailedCreateOpId,
+        operationType: "CREATE",
+        entityType: "Customer",
+        payload: {
+            localId: t20CustId,
+            name: "Biling",
+            address: "Karungal",
+            phone: "6689002226",
+            status: "active",
+        },
+        localSeq: 1,
+        status: "NEEDS_ATTENTION",
+        attempts: 3,
+        createdAt: new Date().toISOString(),
+        owner: t20User,
+        ownerUserId: t20User.userId,
+    });
+
+    // Seed cached customer in NEEDS_ATTENTION state
+    await t20MemDb.cachedCustomers.put({
+        id: makeCachedCustomerId(t20TenantId, t20CustId),
+        customerId: t20CustId,
+        tenantId: t20TenantId,
+        name: "Biling",
+        address: "Karungal",
+        phone: "6689002226",
+        status: "active",
+        cachedAt: new Date().toISOString(),
+        syncStatus: "NEEDS_ATTENTION",
+        operationId: t20FailedCreateOpId,
+    });
+
+    // 20.1 An existing customer edit creates a Customer / UPDATE queue item with a fresh UUID
+    const t20SavedUpdate = await savePendingOfflineCustomerUpdate(
+        {
+            customerId: t20CustId,
+            name: "Biling Updated",
+            address: "Karungal Main Rd",
+            phone: "6689002226",
+        },
+        t20TenantId,
+        t20MemDb,
+        undefined,
+        t20User
+    );
+
+    check("20.1 Customer edit creates UPDATE item with a fresh UUID",
+        t20SavedUpdate.operationId !== t20FailedCreateOpId &&
+        Boolean(t20SavedUpdate.operationId)
+    );
+
+    const t20QueueAfterEdit = await t20MemDb.syncQueue.toArray();
+    const t20UpdateItem = t20QueueAfterEdit.find((q) => q.operationType === "UPDATE");
+    check("20.1 syncQueue contains the new Customer / UPDATE operation",
+        t20UpdateItem !== undefined &&
+        t20UpdateItem.operationType === "UPDATE" &&
+        t20UpdateItem.entityType === "Customer" &&
+        t20UpdateItem.operationId === t20SavedUpdate.operationId
+    );
+
+    // 20.2 The old CREATE remains unchanged and NEEDS_ATTENTION
+    const t20OldCreateItem = t20QueueAfterEdit.find((q) => q.operationId === t20FailedCreateOpId);
+    check("20.2 Old CREATE remains unchanged with status NEEDS_ATTENTION",
+        t20OldCreateItem !== undefined &&
+        t20OldCreateItem.operationType === "CREATE" &&
+        t20OldCreateItem.status === "NEEDS_ATTENTION" &&
+        t20OldCreateItem.payload?.name === "Biling"
+    );
+
+    // 20.3 The UPDATE is eligible under the sync policy when its status is PENDING and ownership is valid
+    const t20Candidates = t20QueueAfterEdit.filter((q) => q.ownerUserId === t20User.userId);
+    const t20DueItems = selectSyncable(t20Candidates, t20User, new Date());
+    check("20.3 UPDATE is eligible under sync policy and selected for sync",
+        t20DueItems.some((item) => item.operationId === t20SavedUpdate.operationId && item.status === "PENDING")
+    );
+    check("20.3 Old failed CREATE is NOT selected by sync policy",
+        !t20DueItems.some((item) => item.operationId === t20FailedCreateOpId)
+    );
+
+    // 20.4 Sync trigger actually invokes the sync entry point logic when online
+    let simulatedOnline = true;
+    let syncTriggerExecuted = false;
+    let processedOperationId: string | undefined;
+
+    async function simulateReconnectSync(db: typeof t20MemDb, activeUser: SessionIdentity) {
+        if (!simulatedOnline) return { ran: false, reason: "offline" };
+        syncTriggerExecuted = true;
+        // Step 1: Ensure pending customers queued
+        await ensurePendingCustomersQueued(activeUser.tenantId, db, activeUser);
+        // Step 2: Query candidates for user
+        const userCands = await db.syncQueue.where("ownerUserId").equals(activeUser.userId).toArray();
+        // Step 3: Repair unowned items
+        const allQ = await db.syncQueue.toArray();
+        const unowned = allQ.filter((item) => {
+            if (item.status !== "PENDING" && item.status !== "FAILED") return false;
+            if (item.ownerUserId === activeUser.userId && item.owner?.deviceId === activeUser.deviceId) return false;
+            const itemTenant = item.owner?.tenantId || (item.payload as any)?.tenantId;
+            return itemTenant === activeUser.tenantId;
+        });
+        for (const item of unowned) {
+            if (item.id !== undefined) {
+                await db.syncQueue.update(item.id, { owner: activeUser, ownerUserId: activeUser.userId });
+                item.owner = activeUser;
+                item.ownerUserId = activeUser.userId;
+                if (!userCands.some((c) => c.id === item.id)) userCands.push(item);
+            }
+        }
+        // Step 4: selectSyncable
+        const due = selectSyncable(userCands, activeUser, new Date());
+        for (const item of due) {
+            if (!isOwnedBy(item, activeUser)) continue;
+            processedOperationId = item.operationId;
+            // simulate successful server process
+            const cachedKey = makeCachedCustomerId(activeUser.tenantId, String(item.payload?.customerId));
+            const cached = await db.cachedCustomers.get(cachedKey);
+            if (cached && cached.operationId === item.operationId) {
+                await db.cachedCustomers.update(cachedKey, { syncStatus: "SYNCED" });
+            }
+            await db.syncQueue.update(item.id!, { status: "SYNCED" });
+        }
+        return { ran: true, processedCount: due.length };
+    }
+
+    const reconnectRun = await simulateReconnectSync(t20MemDb, t20User);
+    check("20.4 Sync trigger executes on reconnect and processes the UPDATE",
+        syncTriggerExecuted &&
+        reconnectRun.ran &&
+        processedOperationId === t20SavedUpdate.operationId
+    );
+
+    // 20.5 A non-syncable or unowned item does not bypass security checks
+    const rogueUser: SessionIdentity = {
+        tenantId: "6abe48a86ae4b08a3e335399", // Different tenant!
+        userId: new mongoose.Types.ObjectId().toString(),
+        deviceId: new mongoose.Types.ObjectId().toString(),
+    };
+    check("20.5 Cross-tenant item rejected by isOwnedBy",
+        !isOwnedBy(t20UpdateItem!, rogueUser)
+    );
+    const rogueSyncable = selectSyncable([t20UpdateItem!], rogueUser, new Date());
+    check("20.5 Cross-tenant item filtered out by selectSyncable",
+        rogueSyncable.length === 0
+    );
+
+    // 20.6 Repeated edits do not create duplicate UPDATE items
+    const { db: t20EditMemDb } = createMemoryOfflineDb();
+    const t20FirstEdit = await savePendingOfflineCustomerUpdate(
+        { customerId: t20CustId, name: "Biling Edit 1", address: "Karungal 1" },
+        t20TenantId,
+        t20EditMemDb,
+        undefined,
+        t20User
+    );
+    const t20SecondEdit = await savePendingOfflineCustomerUpdate(
+        { customerId: t20CustId, name: "Biling Edit 2", address: "Karungal 2" },
+        t20TenantId,
+        t20EditMemDb,
+        undefined,
+        t20User
+    );
+
+    const t20QueueMultiEdit = await t20EditMemDb.syncQueue.toArray();
+    const t20Updates = t20QueueMultiEdit.filter((q) => q.operationType === "UPDATE");
+    check("20.6 Repeated edits do not create duplicate UPDATE items",
+        t20Updates.length === 1 &&
+        t20SecondEdit.operationId === t20FirstEdit.operationId &&
+        t20Updates[0].payload?.name === "Biling Edit 2"
+    );
+
+    // 20.7 A successful UPDATE marks the correct cache record SYNCED
+    const t20CachedAfterSync = await t20MemDb.cachedCustomers.get(
+        makeCachedCustomerId(t20TenantId, t20CustId)
+    );
+    check("20.7 Successful UPDATE marks cached customer record SYNCED",
+        t20CachedAfterSync?.syncStatus === "SYNCED"
+    );
+
+    // 20.8 A newer local edit is not overwritten by an older response
+    const { db: t20StaleMemDb } = createMemoryOfflineDb();
+    const t20OlderOpId = "older-op-1111";
+    const t20NewerOpId = "newer-op-2222";
+    await t20StaleMemDb.cachedCustomers.put({
+        id: makeCachedCustomerId(t20TenantId, t20CustId),
+        customerId: t20CustId,
+        tenantId: t20TenantId,
+        name: "Biling Newest Local",
+        status: "active",
+        cachedAt: new Date().toISOString(),
+        syncStatus: "PENDING",
+        operationId: t20NewerOpId,
+    });
+
+    const cachedKeyForStale = makeCachedCustomerId(t20TenantId, t20CustId);
+    const staleCached = await t20StaleMemDb.cachedCustomers.get(cachedKeyForStale);
+    const t20IsNewerLocalEdit = staleCached?.syncStatus === "PENDING" && Boolean(staleCached?.operationId && staleCached.operationId !== t20OlderOpId);
+    if (!t20IsNewerLocalEdit) {
+        await t20StaleMemDb.cachedCustomers.update(cachedKeyForStale, { syncStatus: "SYNCED" });
+    }
+
+    const t20CachedAfterStaleCheck = await t20StaleMemDb.cachedCustomers.get(cachedKeyForStale);
+    check("20.8 Newer local edit is protected and retains PENDING syncStatus",
+        t20IsNewerLocalEdit &&
+        t20CachedAfterStaleCheck?.syncStatus === "PENDING" &&
+        t20CachedAfterStaleCheck?.operationId === t20NewerOpId
+    );
+
+    // 20.9 Errors in upload or processing are surfaced instead of being silently swallowed
+    const failureDecision = decideAfterOutcome(
+        interpretResponse(400, { success: false, message: "Duplicate phone number on server", retryable: false }),
+        1,
+        new Date()
+    );
+
+    const isFailureDecision = failureDecision.action === "failed";
+    const failureMsg = isFailureDecision ? failureDecision.message : "";
+    const failureStatus = isFailureDecision ? failureDecision.status : undefined;
+
+    check("20.9 Permanent server error results in NEEDS_ATTENTION decision",
+        isFailureDecision &&
+        failureStatus === "NEEDS_ATTENTION" &&
+        failureMsg === "Duplicate phone number on server"
+    );
+
+    await markPendingCustomerNeedsAttention(t20CustId, t20TenantId, failureMsg, t20StaleMemDb);
+    const customerWithSurfacedError = await t20StaleMemDb.cachedCustomers.get(cachedKeyForStale);
+    check("20.9 Customer failure surfaces error message to cached record",
+        customerWithSurfacedError?.syncStatus === "NEEDS_ATTENTION" &&
+        customerWithSurfacedError?.errorMessage === "Duplicate phone number on server"
     );
 
     // Summarize

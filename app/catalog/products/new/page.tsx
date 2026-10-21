@@ -20,6 +20,11 @@ import {
 import { savePendingOfflineProduct } from "@/lib/offline/productCatalogueCache";
 import { addToSyncQueue } from "@/lib/offline/SyncQueueService";
 import { newOperationId } from "@/lib/offline/syncPolicy";
+import {
+  getProductSubmissionFingerprint,
+  resolveProductOperationId,
+  type ProductSubmissionRecord,
+} from "@/lib/catalog/productOperationId";
 
 interface CategoryOption {
   _id: string;
@@ -55,6 +60,7 @@ export default function NewProductPage() {
   const [pending, startTransition] = useTransition();
 
   const submittingRef = useRef(false);
+  const lastSubmissionRef = useRef<ProductSubmissionRecord | null>(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -300,6 +306,28 @@ export default function NewProductPage() {
     submittingRef.current = true;
     startTransition(async () => {
       try {
+        const fingerprint = getProductSubmissionFingerprint({
+          name,
+          SKU: sku,
+          barcode,
+          categoryId,
+          unitId,
+          sellingPrice: sPrice,
+          purchasePrice: canCost ? pPrice : 0,
+          taxRate: tRate,
+          hsnCode: hsnCode.trim() || undefined,
+          openingStock: initStock,
+        });
+
+        const { operationId: opId } = resolveProductOperationId(
+          lastSubmissionRef.current,
+          fingerprint
+        );
+        lastSubmissionRef.current = {
+          operationId: opId,
+          fingerprint,
+        };
+
         const res = await fetch("/api/products", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
@@ -314,6 +342,8 @@ export default function NewProductPage() {
             purchasePrice: canCost ? pPrice : 0,
             ...(tRate !== undefined ? { taxRate: tRate } : {}),
             ...(hsnCode.trim() ? { hsnCode: hsnCode.trim() } : {}),
+            openingStock: initStock,
+            operationId: opId,
             status: "active",
           }),
         });
@@ -325,6 +355,7 @@ export default function NewProductPage() {
           return;
         }
 
+        lastSubmissionRef.current = null;
         router.push("/catalog/products");
       } catch {
         setError("Network error. Could not connect to server.");

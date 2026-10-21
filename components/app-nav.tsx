@@ -2,11 +2,17 @@
 
 import Link from "next/link";
 import { usePathname } from "next/navigation";
-import { useState, type ReactNode } from "react";
+import { useState, type ComponentType, type ReactNode } from "react";
+
+export interface NavLink {
+  href: string;
+  label: string;
+  icon?: ComponentType<{ className?: string }>;
+}
 
 export interface NavGroup {
   title: string;
-  links: { href: string; label: string }[];
+  links: NavLink[];
 }
 
 function isActive(pathname: string, href: string): boolean {
@@ -63,11 +69,10 @@ export function AppNav(props: {
       {/* Main navigation drawer on phone / fixed sidebar on wide screens */}
       <div
         id="app-menu"
-        className={`${
-          open
-            ? "fixed inset-x-0 top-[57px] bottom-0 z-30 overflow-y-auto bg-background"
-            : "hidden"
-        } border-r bg-sidebar lg:sticky lg:top-0 lg:flex lg:h-dvh lg:w-60 lg:shrink-0 lg:flex-col print:hidden`}
+        className={`${open
+          ? "fixed inset-x-0 top-[57px] bottom-0 z-30 overflow-y-auto bg-background"
+          : "hidden"
+          } border-r bg-sidebar lg:sticky lg:top-0 lg:flex lg:h-dvh lg:w-60 lg:shrink-0 lg:flex-col print:hidden`}
       >
         {/* The page header on wide screens: the app and the person's role. */}
         <header className="hidden items-center gap-2 px-4 pt-5 pb-3 lg:flex">
@@ -96,19 +101,20 @@ export function AppNav(props: {
               </p>
               {group.links.map((link) => {
                 const active = isActive(pathname, link.href);
+
                 return (
                   <Link
                     key={link.href}
                     href={link.href}
                     onClick={close}
                     aria-current={active ? "page" : undefined}
-                    className={`rounded-lg px-2 py-2 text-sm transition-colors lg:py-1.5 ${
-                      active
-                        ? "bg-primary/10 font-medium text-primary"
-                        : "hover:bg-muted"
-                    }`}
+                    className={`flex items-center gap-2 rounded-lg px-2 py-2 text-sm transition-colors lg:py-1.5 ${active
+                      ? "bg-primary/10 font-medium text-primary"
+                      : "hover:bg-muted"
+                      }`}
                   >
-                    {link.label}
+
+                    <span>{link.label}</span>
                   </Link>
                 );
               })}

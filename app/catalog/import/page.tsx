@@ -1,10 +1,16 @@
 "use client";
 
-import { useEffect, useState, useTransition } from "react";
+import { useEffect, useRef, useState, useTransition } from "react";
 import Link from "next/link";
 import { AppShell } from "@/components/layout/AppShell";
 import { Button } from "@/components/ui/button";
 import { Label } from "@/components/ui/label";
+import {
+  parseProductCsv,
+  getCsvRowOperationId,
+  type ParsedProductRow as ParsedRow,
+} from "@/lib/csv";
+import { newOperationId } from "@/lib/offline/syncPolicy";
 
 interface Category {
   _id: string;
@@ -17,27 +23,21 @@ interface Unit {
   code: string;
 }
 
-interface ParsedRow {
-  name: string;
-  SKU: string;
-  purchasePrice: number;
-  sellingPrice: number;
-  barcode?: string;
-}
-
 export default function CatalogImportPage() {
   const [categories, setCategories] = useState<Category[]>([]);
   const [units, setUnits] = useState<Unit[]>([]);
   const [selectedCatId, setSelectedCatId] = useState("");
   const [selectedUnitId, setSelectedUnitId] = useState("");
   const [csvText, setCsvText] = useState(
-    "name,SKU,purchasePrice,sellingPrice,barcode\nBasmati Rice 1kg,RICE-001,80,110,8901234567890\nSunflower Oil 1L,OIL-001,120,150,8901234567891"
+    "name,SKU,purchasePrice,sellingPrice,barcode,openingStock\nBasmati Rice 1kg,RICE-001,80,110,8901234567890,50\nSunflower Oil 1L,OIL-001,120,150,8901234567891,25"
   );
   const [parsedRows, setParsedRows] = useState<ParsedRow[]>([]);
   const [loadingLists, setLoadingLists] = useState(true);
   const [importStatus, setImportStatus] = useState<string | null>(null);
   const [importError, setImportError] = useState<string | null>(null);
   const [isPending, startTransition] = useTransition();
+
+  const batchIdRef = useRef<string | null>(null);
 
   useEffect(() => {
     async function loadMetadata() {
@@ -68,47 +68,17 @@ export default function CatalogImportPage() {
   const handleParseCsv = () => {
     setImportError(null);
     setImportStatus(null);
-    const lines = csvText.trim().split("\n");
-    if (lines.length < 2) {
-      setImportError("Please provide a CSV header and at least one product row.");
+    batchIdRef.current = newOperationId();
+
+    const result = parseProductCsv(csvText);
+    if (!result.success || result.errors.length > 0) {
+      setImportError(result.errors.join("\n"));
+      setParsedRows([]);
       return;
     }
 
-    const header = lines[0].split(",").map((h) => h.trim().toLowerCase());
-    const nameIdx = header.indexOf("name");
-    const skuIdx = header.indexOf("sku");
-    const buyIdx = header.findIndex((h) => h.includes("purchase") || h.includes("buy") || h === "purchaseprice");
-    const sellIdx = header.findIndex((h) => h.includes("sell") || h.includes("sellingprice") || h === "price");
-    const barcodeIdx = header.indexOf("barcode");
-
-    if (nameIdx === -1 || skuIdx === -1 || sellIdx === -1) {
-      setImportError("CSV header must include at least: name, SKU, sellingPrice");
-      return;
-    }
-
-    const rows: ParsedRow[] = [];
-    for (let i = 1; i < lines.length; i++) {
-      const line = lines[i].trim();
-      if (!line) continue;
-      const cols = line.split(",").map((c) => c.trim());
-      const name = cols[nameIdx] || "";
-      const SKU = cols[skuIdx] || "";
-      const purchasePrice = buyIdx !== -1 ? Number(cols[buyIdx]) || 0 : 0;
-      const sellingPrice = Number(cols[sellIdx]) || 0;
-      const barcode = barcodeIdx !== -1 ? cols[barcodeIdx] || undefined : undefined;
-
-      if (name && SKU) {
-        rows.push({ name, SKU, purchasePrice, sellingPrice, barcode });
-      }
-    }
-
-    if (rows.length === 0) {
-      setImportError("No valid rows could be parsed from the CSV input.");
-      return;
-    }
-
-    setParsedRows(rows);
-    setImportStatus(`Parsed ${rows.length} product(s). Ready to import.`);
+    setParsedRows(result.rows);
+    setImportStatus(`Parsed ${result.rows.length} product(s). Ready to import.`);
   };
 
   const handleExecuteImport = () => {
@@ -121,14 +91,48 @@ export default function CatalogImportPage() {
       return;
     }
 
+    if (!batchIdRef.current) {
+      batchIdRef.current = newOperationId();
+    }
+    const batchId = batchIdRef.current;
+
+    // Defense-in-depth: Verify no duplicate normalized SKUs exist in preview rows
+    const seenSkus = new Map<string, number>();
+    const duplicateErrors: string[] = [];
+    for (let i = 0; i < parsedRows.length; i++) {
+      const row = parsedRows[i];
+      const rowNum = row.rowNumber ?? i + 2;
+      const norm = row.SKU.trim().toUpperCase();
+      const prev = seenSkus.get(norm);
+      if (prev !== undefined) {
+        duplicateErrors.push(
+          `Row ${rowNum}: Duplicate SKU "${norm}" already appears on row ${prev}. Duplicate SKUs within one CSV file are not permitted.`
+        );
+      } else {
+        seenSkus.set(norm, rowNum);
+      }
+    }
+
+    if (duplicateErrors.length > 0) {
+      setImportError(duplicateErrors.join("\n"));
+      return;
+    }
+
     setImportError(null);
     setImportStatus(null);
 
     startTransition(async () => {
       let importedCount = 0;
       let failedCount = 0;
+      const failureDetails: string[] = [];
+      const succeededSkus = new Set<string>();
 
-      for (const row of parsedRows) {
+      for (let i = 0; i < parsedRows.length; i++) {
+        const row = parsedRows[i];
+        const rowNumber = row.rowNumber ?? i + 2;
+        const normalizedSku = row.SKU.trim().toUpperCase();
+        const operationId = getCsvRowOperationId(batchId, normalizedSku);
+
         try {
           const res = await fetch("/api/products", {
             method: "POST",
@@ -142,27 +146,54 @@ export default function CatalogImportPage() {
               unitId: selectedUnitId,
               purchasePrice: row.purchasePrice,
               sellingPrice: row.sellingPrice,
+              openingStock: row.openingStock ?? 0,
+              operationId,
               status: "active",
             }),
           });
 
-          if (res.ok) {
+          const data = await res.json().catch(() => null);
+
+          if (res.ok && data?.success) {
             importedCount++;
+            succeededSkus.add(normalizedSku);
           } else {
             failedCount++;
+            const reason =
+              data?.message ||
+              (Array.isArray(data?.errors)
+                ? data.errors.map((e: any) => e.message || String(e)).join(", ")
+                : null) ||
+              `HTTP error ${res.status}`;
+            failureDetails.push(`Row ${rowNumber} (${row.SKU}): ${reason}`);
           }
-        } catch {
+        } catch (err: any) {
           failedCount++;
+          failureDetails.push(
+            `Row ${rowNumber} (${row.SKU}): Network error (${err?.message || "connection failed"})`
+          );
         }
       }
 
       setImportStatus(
         `Import finished: ${importedCount} product(s) added successfully${
-          failedCount > 0 ? `, ${failedCount} failed (duplicates or validation errors)` : ""
-        }.`
+          failedCount > 0 ? `, ${failedCount} failed.` : "."
+        }`
       );
-      if (importedCount > 0) {
-        setParsedRows([]);
+
+      if (failureDetails.length > 0) {
+        setImportError(`Failed items:\n${failureDetails.join("\n")}`);
+      } else {
+        setImportError(null);
+      }
+
+      const remainingRows = parsedRows.filter(
+        (r) => !succeededSkus.has(r.SKU.trim().toUpperCase())
+      );
+      setParsedRows(remainingRows);
+
+      if (remainingRows.length === 0) {
+        batchIdRef.current = null;
       }
     });
   };
@@ -182,7 +213,7 @@ export default function CatalogImportPage() {
           </Link>
         </div>
 
-        {importError && <p role="alert" className="text-xs font-medium text-destructive">{importError}</p>}
+        {importError && <p role="alert" className="text-xs font-medium text-destructive whitespace-pre-line">{importError}</p>}
         {importStatus && <p role="status" className="text-xs font-medium text-emerald-600 dark:text-emerald-400">{importStatus}</p>}
 
         <div className="flex flex-col gap-4 rounded-lg border bg-card p-4 text-sm">
@@ -250,12 +281,17 @@ export default function CatalogImportPage() {
               id="import-csv"
               rows={6}
               value={csvText}
-              onChange={(e) => setCsvText(e.target.value)}
+              onChange={(e) => {
+                setCsvText(e.target.value);
+                batchIdRef.current = null;
+                setParsedRows([]);
+                setImportStatus(null);
+              }}
               className="w-full rounded-lg border border-input bg-transparent p-2.5 font-mono text-xs focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-              placeholder="name,SKU,purchasePrice,sellingPrice,barcode"
+              placeholder="name,SKU,purchasePrice,sellingPrice,barcode,openingStock"
             />
             <p className="text-xs text-muted-foreground">
-              Columns required: <code>name</code>, <code>SKU</code>, <code>sellingPrice</code>. Optional: <code>purchasePrice</code>, <code>barcode</code>.
+              Columns required: <code>name</code>, <code>SKU</code>, <code>sellingPrice</code>. Optional: <code>purchasePrice</code>, <code>barcode</code>, <code>openingStock</code>.
             </p>
           </div>
 
@@ -287,6 +323,7 @@ export default function CatalogImportPage() {
                     <th className="p-2.5 font-medium">SKU</th>
                     <th className="p-2.5 text-right font-medium">Cost (₹)</th>
                     <th className="p-2.5 text-right font-medium">Selling (₹)</th>
+                    <th className="p-2.5 text-right font-medium">Opening Stock</th>
                     <th className="p-2.5 font-medium">Barcode</th>
                   </tr>
                 </thead>
@@ -297,6 +334,7 @@ export default function CatalogImportPage() {
                       <td className="p-2.5 text-muted-foreground font-mono text-xs">{r.SKU}</td>
                       <td className="p-2.5 text-right tabular-nums">{r.purchasePrice.toFixed(2)}</td>
                       <td className="p-2.5 text-right tabular-nums font-semibold">{r.sellingPrice.toFixed(2)}</td>
+                      <td className="p-2.5 text-right tabular-nums">{r.openingStock ?? 0}</td>
                       <td className="p-2.5 text-muted-foreground font-mono text-xs">{r.barcode || "—"}</td>
                     </tr>
                   ))}

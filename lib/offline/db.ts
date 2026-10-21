@@ -132,6 +132,58 @@ export interface CachedCustomerRecord {
     errorMessage?: string;
 }
 
+export interface CachedSupplierRecord {
+    // Unique key in table: `${tenantId}:${supplierId}` for multi-tenant safety
+    id: string;
+
+    // Original supplier ID from server (e.g. MongoDB _id), or local client UUID if pending (e.g. `sup_${uuid}`)
+    supplierId: string;
+
+    // Tenant boundary: queries are strictly filtered by this
+    tenantId: string;
+
+    // Assigned sequential supplier code (e.g. "SUP-0001") or temporary code ("SUP-TEMP-...")
+    supplierCode?: string;
+
+    name: string;
+    contactPerson?: string;
+    phone?: string;
+    altPhone?: string;
+    email?: string;
+    website?: string;
+    address?: string;
+    line1?: string;
+    line2?: string;
+    city?: string;
+    state?: string;
+    pincode?: string;
+    country?: string;
+
+    gstin?: string;
+    pan?: string;
+
+    paymentType?: "cash" | "credit";
+    creditDays?: number;
+    creditLimit?: number;
+
+    category?: string;
+    notes?: string;
+
+    status: "active" | "inactive" | "blocked";
+
+    // ISO timestamp when this record was cached
+    cachedAt: string;
+
+    // Offline supplier creation/update sync status (PENDING, SYNCED, or NEEDS_ATTENTION)
+    syncStatus?: "PENDING" | "SYNCED" | "NEEDS_ATTENTION";
+
+    // Operation ID of the corresponding SyncQueueItem
+    operationId?: string;
+
+    // Error message if sync failed and needs attention
+    errorMessage?: string;
+}
+
 // Key of the last server-confirmed identity in the meta table.
 export const LAST_IDENTITY_KEY = "lastSessionIdentity";
 
@@ -141,6 +193,7 @@ export class OfflineDatabase extends Dexie {
     offlineSessions!: Table<OfflineSessionRecord, string>;
     cachedProducts!: Table<CachedProductRecord, string>;
     cachedCustomers!: Table<CachedCustomerRecord, string>;
+    cachedSuppliers!: Table<CachedSupplierRecord, string>;
 
     constructor() {
         super("billing_offline_db");
@@ -197,7 +250,20 @@ export class OfflineDatabase extends Dexie {
             cachedProducts: "id, tenantId, SKU, barcode, status",
             cachedCustomers: "id, tenantId, customerId, name, phone, status",
         });
+
+        // Version 6: offline supplier cache (isolated by tenant).
+        // Only a new table: existing tables and queued operations
+        // are kept exactly as they are (no upgrade function).
+        this.version(6).stores({
+            syncQueue: "++id, operationId, status, localSeq, createdAt, ownerUserId",
+            meta: "key",
+            offlineSessions: "key",
+            cachedProducts: "id, tenantId, SKU, barcode, status",
+            cachedCustomers: "id, tenantId, customerId, name, phone, status",
+            cachedSuppliers: "id, tenantId, supplierId, supplierCode, name, phone, status",
+        });
     }
 }
 
 export const offlineDB = new OfflineDatabase();
+

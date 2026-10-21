@@ -10,6 +10,7 @@ import { Unit } from "@/lib/models/Unit";
 import { getAuthenticatedContext } from "@/lib/auth/getAuthenticatedContext";
 import { hasPermission, getGrantedPermissions } from "@/lib/auth/hasPermission";
 import { AuditLogService } from "@/lib/services/AuditLogService";
+import { StockService } from "@/lib/services/StockService";
 import {
     PRODUCT_COST_PERMISSIONS,
     hasCostPermission,
@@ -116,6 +117,9 @@ export async function GET(request: NextRequest) {
 
 // POST: Create a product and its audit log atomically.
 export async function POST(request: NextRequest) {
+    let duplicateCheckTenantId: mongoose.Types.ObjectId | undefined;
+    let duplicateCheckOpId: string | undefined;
+
     try {
         const auth = await getAuthenticatedContext(request);
 
@@ -178,10 +182,33 @@ export async function POST(request: NextRequest) {
 
         const data = parsed.data;
         const tenantId = new mongoose.Types.ObjectId(auth.tenantId);
+        const normalizedOperationId = data.operationId?.trim() || undefined;
+        duplicateCheckTenantId = tenantId;
+        duplicateCheckOpId = normalizedOperationId;
 
-        // Confirm the category and unit belong to this tenant.
         await connectDB();
 
+        // Idempotency check: if an operationId was provided and product was already created, return it.
+        if (normalizedOperationId) {
+            const existingByOpId = await Product.findOne({
+                tenantId,
+                operationId: normalizedOperationId,
+            }).lean();
+
+            if (existingByOpId) {
+                return NextResponse.json(
+                    {
+                        success: true,
+                        message: "Product created successfully",
+                        product: existingByOpId,
+                        alreadyProcessed: true,
+                    },
+                    { status: 200 }
+                );
+            }
+        }
+
+        // Confirm the category and unit belong to this tenant.
         const [category, unit] = await Promise.all([
             Category.findOne({
                 _id: new mongoose.Types.ObjectId(data.categoryId),
@@ -265,7 +292,7 @@ export async function POST(request: NextRequest) {
             );
         }
 
-        // Product creation and audit logging share one transaction.
+        // Product creation, audit logging, and initial stock movement share one transaction.
         const session = await mongoose.startSession();
 
         try {
@@ -291,6 +318,9 @@ export async function POST(request: NextRequest) {
                                 : {}),
                             ...(data.hsnCode?.trim()
                                 ? { hsnCode: data.hsnCode.trim() }
+                                : {}),
+                            ...(normalizedOperationId
+                                ? { operationId: normalizedOperationId }
                                 : {}),
                             status: data.status ?? "active",
                         },
@@ -319,11 +349,43 @@ export async function POST(request: NextRequest) {
                             stockQuantity: product.stockQuantity,
                             taxRate: product.taxRate,
                             hsnCode: product.hsnCode,
+                            operationId: normalizedOperationId,
                             status: product.status,
                         },
                     },
                     session
                 );
+
+                const openingStock =
+                    typeof data.openingStock === "number" &&
+                    Number.isFinite(data.openingStock) &&
+                    data.openingStock > 0
+                        ? data.openingStock
+                        : 0;
+
+                if (openingStock > 0) {
+                    const movementOpId = normalizedOperationId
+                        ? `${normalizedOperationId}:opening-stock`
+                        : `${product._id.toString()}:opening-stock`;
+
+                    await StockService.changeStock(
+                        {
+                            userId: new mongoose.Types.ObjectId(auth.userId),
+                            tenantId,
+                        },
+                        {
+                            productId: product._id.toString(),
+                            quantity: openingStock,
+                            type: "adjustment",
+                            warehouse: { name: "Main Store" },
+                            reason: "Initial opening stock",
+                        },
+                        session,
+                        movementOpId
+                    );
+
+                    product.stockQuantity = openingStock;
+                }
 
                 return product.toObject();
             });
@@ -354,6 +416,25 @@ export async function POST(request: NextRequest) {
             error.code === 11000
         ) {
             const keyPattern = (error as { keyPattern?: Record<string, unknown> }).keyPattern;
+            if (keyPattern?.operationId && duplicateCheckOpId && duplicateCheckTenantId) {
+                const existing = await Product.findOne({
+                    tenantId: duplicateCheckTenantId,
+                    operationId: duplicateCheckOpId,
+                })
+                    .populate("category", "name")
+                    .populate("unit", "name shortName")
+                    .lean();
+
+                if (existing) {
+                    return NextResponse.json({
+                        success: true,
+                        message: "Product already created",
+                        product: existing,
+                        alreadyProcessed: true,
+                    });
+                }
+            }
+
             let message = "A product with this SKU or barcode already exists";
             if (keyPattern) {
                 if (keyPattern.barcode) {

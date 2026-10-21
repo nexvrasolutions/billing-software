@@ -22,10 +22,19 @@ import {
     markPendingProductNeedsAttention,
 } from "./productCatalogueCache";
 import {
+    makeCachedCustomerId,
     resolvePendingCustomerId,
     markPendingCustomerNeedsAttention,
     ensurePendingCustomersQueued,
 } from "./customerCache";
+import {
+    makeCachedSupplierId,
+    resolvePendingSupplierId,
+    markPendingSupplierNeedsAttention,
+    ensurePendingSuppliersQueued,
+    isTemporarySupplierId,
+} from "./supplierCache";
+import { normalizeSupplierUpdatePayload } from "../validations/syncOperations";
 
 const SYNC_LOCK_NAME = "billing-offline-sync";
 
@@ -94,12 +103,71 @@ async function syncOne(item: SyncQueueItem, identity: SessionIdentity): Promise<
     const id = item.id!;
     await markSyncing(id);
 
+    // Safety check for dependent Purchase: ensure supplier ID is valid server ID before uploading to server
+    if (item.entityType === "Purchase") {
+        const rawSupId = typeof item.payload?.supplierId === "string" ? item.payload.supplierId.trim() : "";
+        if (rawSupId && isTemporarySupplierId(rawSupId)) {
+            const cachedKey = makeCachedSupplierId(identity.tenantId, rawSupId);
+            const cached = await offlineDB.cachedSuppliers.get(cachedKey);
+
+            if (cached && cached.syncStatus === "NEEDS_ATTENTION") {
+                await markAttemptFailed(
+                    id,
+                    item.attempts,
+                    "NEEDS_ATTENTION",
+                    `Dependent supplier creation requires attention: ${cached.errorMessage || "Validation or conflict error"}. Resolve supplier before syncing this purchase.`
+                );
+                return {
+                    operationId: item.operationId,
+                    status: "NEEDS_ATTENTION",
+                    attempts: item.attempts + 1,
+                    error: "Dependent supplier creation requires attention",
+                };
+            }
+
+            if (!cached) {
+                await markAttemptFailed(
+                    id,
+                    item.attempts,
+                    "NEEDS_ATTENTION",
+                    `Dependent temporary supplier ${rawSupId} not found in offline cache. Cannot safely sync purchase.`
+                );
+                return {
+                    operationId: item.operationId,
+                    status: "NEEDS_ATTENTION",
+                    attempts: item.attempts + 1,
+                    error: "Dependent supplier not found",
+                };
+            }
+
+            // Supplier is still pending synchronization; defer purchase upload without counting an attempt
+            await releaseItem(id, item.status === "FAILED" ? "FAILED" : "PENDING", { lastAttemptAt: item.lastAttemptAt });
+            return { operationId: item.operationId, status: "SKIPPED", attempts: item.attempts };
+        }
+    }
+
     // 1. Upload (idempotent: a repeat upload of the same item is accepted).
+    let uploadPayload = item.payload;
+    if (
+        item.entityType === "Supplier" &&
+        item.operationType === "UPDATE" &&
+        uploadPayload &&
+        typeof uploadPayload === "object"
+    ) {
+        const normalized = normalizeSupplierUpdatePayload(uploadPayload as Record<string, unknown>);
+        if (normalized !== uploadPayload) {
+            uploadPayload = normalized;
+            if (id !== undefined) {
+                await offlineDB.syncQueue.update(id, { payload: normalized }).catch(() => {});
+            }
+        }
+    }
+
     let { outcome, data: uploadData } = await postJson("/api/sync-operations", {
         operationId: item.operationId,
         operationType: item.operationType,
         entityType: item.entityType,
-        payload: item.payload,
+        payload: uploadPayload,
         owner: identity,
     });
 
@@ -129,8 +197,8 @@ async function syncOne(item: SyncQueueItem, identity: SessionIdentity): Promise<
             }
         }
 
-        // If this was a Customer, resolve its local client ID to the server MongoDB ObjectId
-        if (item.entityType === "Customer" && item.payload?.localId) {
+        // If this was a Customer CREATE, resolve its local client ID to the server MongoDB ObjectId
+        if (item.entityType === "Customer" && item.payload?.localId && item.operationType !== "UPDATE") {
             const serverId = processData?.result?._id || processData?.entityId || processData?.customer?._id;
             if (serverId) {
                 await resolvePendingCustomerId(
@@ -138,6 +206,68 @@ async function syncOne(item: SyncQueueItem, identity: SessionIdentity): Promise<
                     String(serverId),
                     identity.tenantId
                 );
+            }
+        }
+
+        // If this was a Customer UPDATE, reconcile the local customer cache
+        if (item.entityType === "Customer" && item.operationType === "UPDATE") {
+            const targetCustomerId = String(item.payload?.customerId || item.payload?._id || "");
+            if (targetCustomerId) {
+                const cachedKey = makeCachedCustomerId(identity.tenantId, targetCustomerId);
+                const cached = await offlineDB.cachedCustomers.get(cachedKey);
+
+                if (cached && cached.tenantId === identity.tenantId) {
+                    // Stale response protection:
+                    // If the user made a newer edit while this operation was in flight,
+                    // cached.operationId will be different from item.operationId.
+                    const isNewerLocalEdit = cached.syncStatus === "PENDING" && Boolean(cached.operationId && cached.operationId !== item.operationId);
+                    if (!isNewerLocalEdit) {
+                        await offlineDB.cachedCustomers.update(cachedKey, {
+                            syncStatus: "SYNCED",
+                            errorMessage: undefined,
+                            cachedAt: new Date().toISOString(),
+                        });
+                    }
+                }
+            }
+        }
+
+        // If this was a Supplier CREATE, resolve its local client ID and temp code to the server MongoDB ObjectId and official code
+        if (item.entityType === "Supplier" && item.payload?.localId && item.operationType !== "UPDATE") {
+            const serverId = processData?.result?._id || processData?.entityId || processData?.supplier?._id || processData?.result?.supplierId;
+            const serverCode = processData?.result?.supplierCode || processData?.supplierCode;
+            if (serverId) {
+                await resolvePendingSupplierId(
+                    String(item.payload.localId),
+                    String(serverId),
+                    String(serverCode || ""),
+                    identity.tenantId,
+                    offlineDB,
+                    item.operationId
+                );
+            }
+        }
+
+        // If this was a Supplier UPDATE, reconcile the local supplier cache
+        if (item.entityType === "Supplier" && item.operationType === "UPDATE") {
+            const targetSupplierId = String(item.payload?.supplierId || item.payload?._id || "");
+            if (targetSupplierId) {
+                const cachedKey = makeCachedSupplierId(identity.tenantId, targetSupplierId);
+                const cached = await offlineDB.cachedSuppliers.get(cachedKey);
+
+                if (cached && cached.tenantId === identity.tenantId) {
+                    // Stale response protection:
+                    // If the user made a newer edit while this operation was in flight,
+                    // cached.operationId will be different from item.operationId.
+                    const isNewerLocalEdit = cached.syncStatus === "PENDING" && Boolean(cached.operationId && cached.operationId !== item.operationId);
+                    if (!isNewerLocalEdit) {
+                        await offlineDB.cachedSuppliers.update(cachedKey, {
+                            syncStatus: "SYNCED",
+                            errorMessage: undefined,
+                            cachedAt: new Date().toISOString(),
+                        });
+                    }
+                }
             }
         }
 
@@ -201,9 +331,10 @@ async function syncOne(item: SyncQueueItem, identity: SessionIdentity): Promise<
 
     // If a Customer failed permanently (e.g. NEEDS_ATTENTION), cascade to cached customer and dependent sales
     if (item.entityType === "Customer" && decision.status === "NEEDS_ATTENTION") {
-        if (item.payload?.localId) {
+        const targetId = item.payload?.localId || item.payload?.customerId || item.payload?._id;
+        if (targetId) {
             await markPendingCustomerNeedsAttention(
-                String(item.payload.localId),
+                String(targetId),
                 identity.tenantId,
                 decision.message
             );
@@ -221,6 +352,40 @@ async function syncOne(item: SyncQueueItem, identity: SessionIdentity): Promise<
                     dep.attempts,
                     "NEEDS_ATTENTION",
                     `Dependent customer creation failed: ${decision.message}. Resolve the customer conflict to sync this sale.`
+                );
+            }
+        }
+    }
+
+    // If a Supplier failed permanently (e.g. NEEDS_ATTENTION), cascade to cached supplier and dependent purchases
+    if (item.entityType === "Supplier" && decision.status === "NEEDS_ATTENTION") {
+        const targetId = item.payload?.localId || item.payload?.supplierId || item.payload?._id;
+        if (targetId) {
+            await markPendingSupplierNeedsAttention(
+                String(targetId),
+                identity.tenantId,
+                decision.message
+            );
+        }
+
+        // Cascade NEEDS_ATTENTION to dependent purchases in syncQueue
+        const localSupId = String(item.payload?.localId || item.payload?.supplierId || "");
+        const dependents = await offlineDB.syncQueue
+            .filter((q) => {
+                if (q.status === "SYNCED") return false;
+                const matchesDependsOn = Boolean(q.dependsOn && q.dependsOn.includes(item.operationId));
+                const matchesSupplierId = q.entityType === "Purchase" && Boolean(localSupId && q.payload?.supplierId === localSupId);
+                return matchesDependsOn || matchesSupplierId;
+            })
+            .toArray();
+
+        for (const dep of dependents) {
+            if (dep.id !== undefined && dep.status !== "SYNCED") {
+                await markAttemptFailed(
+                    dep.id,
+                    dep.attempts,
+                    "NEEDS_ATTENTION",
+                    `Dependent supplier creation failed: ${decision.message}. Resolve the supplier conflict to sync this purchase.`
                 );
             }
         }
@@ -248,13 +413,15 @@ async function runSync(holdsExclusiveLock: boolean): Promise<SyncRunResult> {
     await rememberSessionIdentity(identity);
     await recoverInterrupted(identity, holdsExclusiveLock);
     await ensurePendingCustomersQueued(identity.tenantId, offlineDB, identity);
+    await ensurePendingSuppliersQueued(identity.tenantId, offlineDB, identity);
 
     const userCandidates = await offlineDB.syncQueue.where("ownerUserId").equals(identity.userId).toArray();
     const allQueue = await offlineDB.syncQueue.toArray();
     const unownedForTenant = allQueue.filter((item) => {
         if (item.status !== "PENDING" && item.status !== "FAILED") return false;
-        if (item.ownerUserId === identity.userId) return false;
-        return item.owner?.tenantId === identity.tenantId && (!item.ownerUserId || !item.owner?.userId);
+        if (item.ownerUserId === identity.userId && item.owner?.deviceId === identity.deviceId) return false;
+        const itemTenant = item.owner?.tenantId || (item.payload as any)?.tenantId;
+        return itemTenant === identity.tenantId;
     });
 
     for (const item of unownedForTenant) {
@@ -265,7 +432,9 @@ async function runSync(holdsExclusiveLock: boolean): Promise<SyncRunResult> {
             });
             item.owner = identity;
             item.ownerUserId = identity.userId;
-            userCandidates.push(item);
+            if (!userCandidates.some((c) => c.id === item.id)) {
+                userCandidates.push(item);
+            }
         }
     }
 

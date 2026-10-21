@@ -3,7 +3,12 @@ import mongoose from "mongoose";
 
 import { connectDB } from "@/lib/db/mongodb";
 import { Purchase } from "@/lib/models/Purchase";
+import { Payment } from "@/lib/models/Payment";
 import { getAuthenticatedContext } from "@/lib/auth/getAuthenticatedContext";
+import {
+    BUSINESS_PERMISSIONS,
+    requireAnyBusinessPermission,
+} from "@/lib/auth/businessPermissions";
 
 type RouteContext = {
     params: Promise<{ id: string }>;
@@ -22,6 +27,14 @@ export async function GET(
             );
         }
 
+        const denied = await requireAnyBusinessPermission(auth, [
+            BUSINESS_PERMISSIONS.purchasesRead,
+            BUSINESS_PERMISSIONS.purchasesCreate,
+        ]);
+        if (denied) {
+            return denied;
+        }
+
         const { id } = await context.params;
         if (!mongoose.Types.ObjectId.isValid(id)) {
             return NextResponse.json(
@@ -31,9 +44,12 @@ export async function GET(
         }
 
         await connectDB();
+        const tenantId = new mongoose.Types.ObjectId(auth.tenantId);
+        const purchaseId = new mongoose.Types.ObjectId(id);
+
         const purchase = await Purchase.findOne({
-            _id: new mongoose.Types.ObjectId(id),
-            tenantId: new mongoose.Types.ObjectId(auth.tenantId),
+            _id: purchaseId,
+            tenantId,
         }).lean();
 
         if (!purchase) {
@@ -43,9 +59,17 @@ export async function GET(
             );
         }
 
+        const payments = await Payment.find({
+            tenantId,
+            purchaseId,
+        })
+            .sort({ paymentDate: -1, createdAt: -1 })
+            .lean();
+
         return NextResponse.json({
             success: true,
             purchase,
+            payments,
         });
     } catch (error) {
         console.error("GET PURCHASE ERROR:", error);

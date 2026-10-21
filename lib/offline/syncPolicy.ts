@@ -65,8 +65,8 @@ export function selectSyncable<T extends QueueItemState>(items: T[], identity: S
             return true;
         })
         .sort((a, b) => {
-            // Process Product and Customer creations before dependent operations (e.g. Sales)
-            const isPrerequisite = (type?: string) => type === "Product" || type === "Customer";
+            // Process Product, Customer, and Supplier creations before dependent operations (e.g. Sales, Purchases)
+            const isPrerequisite = (type?: string) => type === "Product" || type === "Customer" || type === "Supplier";
             if (isPrerequisite(a.entityType) && !isPrerequisite(b.entityType)) return -1;
             if (!isPrerequisite(a.entityType) && isPrerequisite(b.entityType)) return 1;
             return a.localSeq - b.localSeq;

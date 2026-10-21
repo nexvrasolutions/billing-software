@@ -16,6 +16,7 @@
  */
 
 import { offlineDB, type CachedProductRecord, type OfflineDatabase } from "./db";
+import { parseFiniteNumber } from "../validations/product";
 
 export type { CachedProductRecord };
 
@@ -408,6 +409,29 @@ export async function savePendingOfflineProduct(
 
     const barcode = input.barcode?.trim() ? input.barcode.trim().toUpperCase() : undefined;
 
+    const sellingPrice = parseFiniteNumber(input.sellingPrice);
+    if (sellingPrice === null || sellingPrice < 0) {
+        throw new Error("Valid non-negative selling price is required");
+    }
+
+    let stockQuantity = 0;
+    if (input.stockQuantity !== undefined && input.stockQuantity !== null) {
+        const parsedStock = parseFiniteNumber(input.stockQuantity);
+        if (parsedStock === null || parsedStock < 0) {
+            throw new Error("Opening stock quantity must be non-negative");
+        }
+        stockQuantity = parsedStock;
+    }
+
+    let taxRate: number | undefined = undefined;
+    if (input.taxRate !== undefined && input.taxRate !== null) {
+        const parsedTax = parseFiniteNumber(input.taxRate);
+        if (parsedTax === null || parsedTax < 0 || parsedTax > 100) {
+            throw new Error("Tax rate must be between 0 and 100");
+        }
+        taxRate = parsedTax;
+    }
+
     return await db.transaction("rw", db.cachedProducts, async () => {
         const existing = await db.cachedProducts.where("tenantId").equals(cleanTenantId).toArray();
 
@@ -436,15 +460,15 @@ export async function savePendingOfflineProduct(
             ...(barcode ? { barcode } : {}),
             ...(input.categoryId ? { categoryId: input.categoryId.trim() } : {}),
             ...(input.unitId ? { unitId: input.unitId.trim() } : {}),
-            sellingPrice: Math.max(0, input.sellingPrice),
-            stockQuantity: Math.max(0, input.stockQuantity ?? 0),
+            sellingPrice,
+            stockQuantity,
             status: "active",
-            ...(input.taxRate !== undefined ? { taxRate: input.taxRate } : {}),
+            ...(taxRate !== undefined ? { taxRate } : {}),
             ...(input.hsnCode?.trim() ? { hsnCode: input.hsnCode.trim() } : {}),
             cachedAt: now,
             syncStatus: "PENDING",
             operationId: input.operationId,
-            initialStock: input.stockQuantity,
+            initialStock: stockQuantity,
         };
 
         await db.cachedProducts.put(record);

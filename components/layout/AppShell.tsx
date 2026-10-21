@@ -2,6 +2,7 @@
 
 import { useEffect, useState, type ReactNode } from "react";
 import { usePathname, useRouter } from "next/navigation";
+import { ShoppingBag } from "lucide-react";
 import { AppNav, type NavGroup } from "@/components/app-nav";
 import { getOfflineAccessOverview, restoreOfflineSession } from "@/lib/offline/offlineAccess";
 import { SESSION_CHECK_TIMEOUT_MS } from "@/lib/offline/sessionIdentity";
@@ -37,7 +38,7 @@ const NAV_GROUPS: (NavGroup & { permission?: string })[] = [
             { href: "/catalog/lists", label: "Categories & units" },
             { href: "/inventory", label: "Inventory" },
             { href: "/inventory/opening", label: "Opening stock" },
-            { href: "/purchases", label: "Purchases" },
+            { href: "/purchases", label: "Purchases", icon: ShoppingBag },
             { href: "/suppliers", label: "Suppliers" },
             { href: "/catalog/import", label: "Import products" },
         ],
@@ -180,8 +181,8 @@ export function AppShell({ children }: { children: ReactNode }) {
                 "/inventory": "products.read",
                 "/inventory/opening": "stock.adjust",
                 "/catalog/import": "products.create",
-                "/purchases": "purchases.read",
-                "/suppliers": "suppliers.read",
+                "/purchases": ["purchases.create", "purchases.read"],
+                "/suppliers": ["purchases.create", "purchases.read", "products.read", "users.read"],
                 "/sales": "sales.read",
                 "/pos": "sales.create",
                 "/customers": ["sales.create", "sales.read", "products.read", "users.read"],

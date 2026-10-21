@@ -7,6 +7,7 @@ import { StockService } from "@/lib/services/StockService";
 import { SyncProcessError } from "@/lib/services/SyncErrors";
 import { getGrantedPermissions } from "@/lib/auth/hasPermission";
 import { PRODUCT_COST_PERMISSIONS, hasCostPermission } from "@/lib/catalog/productProjection";
+import { parseFiniteNumber } from "@/lib/validations/product";
 
 export interface ProductSyncUserContext {
     userId: mongoose.Types.ObjectId;
@@ -53,15 +54,6 @@ export class ProductSyncService {
             : undefined;
         const categoryId = typeof payload.categoryId === "string" ? payload.categoryId.trim() : "";
         const unitId = typeof payload.unitId === "string" ? payload.unitId.trim() : "";
-        const sellingPrice = typeof payload.sellingPrice === "number" ? payload.sellingPrice : Number(payload.sellingPrice);
-        const purchasePrice = typeof payload.purchasePrice === "number" ? payload.purchasePrice : Number(payload.purchasePrice || 0);
-        const taxRate = payload.taxRate !== undefined && payload.taxRate !== null ? Number(payload.taxRate) : undefined;
-        const hsnCode = typeof payload.hsnCode === "string" && payload.hsnCode.trim() ? payload.hsnCode.trim() : undefined;
-        const initialStock = payload.initialStock !== undefined && payload.initialStock !== null
-            ? Number(payload.initialStock)
-            : payload.openingStock !== undefined && payload.openingStock !== null
-            ? Number(payload.openingStock)
-            : 0;
 
         if (!name || name.length > 200) {
             throw new SyncProcessError(422, "PERMANENT_FAILURE", "Product name is required (max 200 characters)", false);
@@ -73,10 +65,6 @@ export class ProductSyncService {
 
         const sku = rawSku.toUpperCase();
 
-        if (isNaN(sellingPrice) || sellingPrice < 0) {
-            throw new SyncProcessError(422, "PERMANENT_FAILURE", "Valid non-negative selling price is required", false);
-        }
-
         if (!mongoose.isValidObjectId(categoryId)) {
             throw new SyncProcessError(422, "PERMANENT_FAILURE", "Invalid category ID", false);
         }
@@ -85,13 +73,69 @@ export class ProductSyncService {
             throw new SyncProcessError(422, "PERMANENT_FAILURE", "Invalid unit ID", false);
         }
 
-        if (taxRate !== undefined && (isNaN(taxRate) || taxRate < 0 || taxRate > 100)) {
-            throw new SyncProcessError(422, "PERMANENT_FAILURE", "Tax rate must be between 0 and 100", false);
+        // Selling Price: required, finite, non-negative
+        if (payload.sellingPrice === undefined || payload.sellingPrice === null) {
+            throw new SyncProcessError(422, "PERMANENT_FAILURE", "Valid non-negative selling price is required", false);
+        }
+        const parsedSellingPrice = parseFiniteNumber(payload.sellingPrice);
+        if (parsedSellingPrice === null || parsedSellingPrice < 0) {
+            throw new SyncProcessError(422, "PERMANENT_FAILURE", "Valid non-negative selling price is required", false);
+        }
+        const sellingPrice = parsedSellingPrice;
+
+        // Purchase Price: optional (defaults to 0), but if provided must be finite and non-negative
+        let purchasePrice = 0;
+        if (payload.purchasePrice !== undefined && payload.purchasePrice !== null) {
+            const parsedPurchase = parseFiniteNumber(payload.purchasePrice);
+            if (parsedPurchase === null || parsedPurchase < 0) {
+                throw new SyncProcessError(422, "PERMANENT_FAILURE", "Valid non-negative purchase price is required", false);
+            }
+            purchasePrice = parsedPurchase;
         }
 
-        if (isNaN(initialStock) || initialStock < 0) {
-            throw new SyncProcessError(422, "PERMANENT_FAILURE", "Opening stock quantity must be non-negative", false);
+        // Tax Rate: optional, finite, between 0 and 100
+        let taxRate: number | undefined = undefined;
+        if (payload.taxRate !== undefined && payload.taxRate !== null) {
+            const parsedTax = parseFiniteNumber(payload.taxRate);
+            if (parsedTax === null || parsedTax < 0 || parsedTax > 100) {
+                throw new SyncProcessError(422, "PERMANENT_FAILURE", "Tax rate must be between 0 and 100", false);
+            }
+            taxRate = parsedTax;
         }
+
+        // Initial/Opening Stock: optional (defaults to 0), finite, non-negative
+        let initialStock = 0;
+        const rawStock = payload.initialStock !== undefined && payload.initialStock !== null
+            ? payload.initialStock
+            : payload.openingStock !== undefined && payload.openingStock !== null
+            ? payload.openingStock
+            : undefined;
+
+        if (rawStock !== undefined) {
+            const parsedStock = parseFiniteNumber(rawStock);
+            if (parsedStock === null || parsedStock < 0) {
+                throw new SyncProcessError(422, "PERMANENT_FAILURE", "Opening stock quantity must be non-negative", false);
+            }
+            initialStock = parsedStock;
+        }
+
+        // Stock quantity (if provided in payload)
+        if (payload.stockQuantity !== undefined && payload.stockQuantity !== null) {
+            const parsedStockQty = parseFiniteNumber(payload.stockQuantity);
+            if (parsedStockQty === null || parsedStockQty < 0) {
+                throw new SyncProcessError(422, "PERMANENT_FAILURE", "Stock quantity must be non-negative", false);
+            }
+        }
+
+        // Reorder level (if provided in payload)
+        if (payload.reorderLevel !== undefined && payload.reorderLevel !== null) {
+            const parsedReorder = parseFiniteNumber(payload.reorderLevel);
+            if (parsedReorder === null || parsedReorder < 0) {
+                throw new SyncProcessError(422, "PERMANENT_FAILURE", "Reorder level must be non-negative", false);
+            }
+        }
+
+        const hsnCode = typeof payload.hsnCode === "string" && payload.hsnCode.trim() ? payload.hsnCode.trim() : undefined;
 
         // 3. Verify cost permission
         let allowedPurchasePrice = 0;
@@ -101,7 +145,7 @@ export class ProductSyncService {
                 tenantId: user.tenantId.toString(),
                 permissions: [...PRODUCT_COST_PERMISSIONS],
             });
-            if (hasCostPermission(granted) && !isNaN(purchasePrice) && purchasePrice >= 0) {
+            if (hasCostPermission(granted)) {
                 allowedPurchasePrice = purchasePrice;
             }
         } catch {
@@ -229,7 +273,7 @@ export class ProductSyncService {
                             productId: product._id.toString(),
                             quantity: initialStock,
                             type: "adjustment",
-                            warehouse: { name: "Default" },
+                            warehouse: { name: "Main Store" },
                             reason: "Initial opening stock",
                         },
                         session,

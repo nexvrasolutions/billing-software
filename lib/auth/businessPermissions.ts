@@ -19,6 +19,7 @@ export const BUSINESS_PERMISSIONS = {
     salesBackdate: "sales.backdate",
     salesReturnsCreate: "salesReturns.create",
     purchasesCreate: "purchases.create",
+    purchasesRead: "purchases.read",
     purchaseReturnsCreate: "purchaseReturns.create",
     paymentsCreate: "payments.create",
     stockAdjust: "stock.adjust",
@@ -40,6 +41,7 @@ export const SYNC_ENTITY_PERMISSIONS: Readonly<Record<string, BusinessPermission
     Payment: BUSINESS_PERMISSIONS.paymentsCreate,
     StockAdjustment: BUSINESS_PERMISSIONS.stockAdjust,
     Customer: BUSINESS_PERMISSIONS.salesCreate,
+    Supplier: BUSINESS_PERMISSIONS.purchasesCreate,
 });
 
 /**
@@ -105,3 +107,27 @@ export async function requireBusinessPermission(
         { status: 403 }
     );
 }
+
+/**
+ * For route handlers requiring any one of several business permissions.
+ * Returns null when the user holds at least one of the permissions,
+ * otherwise returns a standard HTTP 403 response.
+ */
+export async function requireAnyBusinessPermission(
+    context: AuthenticatedContext,
+    permissions: BusinessPermission[]
+): Promise<NextResponse | null> {
+    const granted = await getGrantedBusinessPermissions(context, permissions);
+
+    for (const perm of permissions) {
+        if (granted.has(perm)) {
+            return null;
+        }
+    }
+
+    return NextResponse.json(
+        { success: false, message: "Permission denied" },
+        { status: 403 }
+    );
+}
+
