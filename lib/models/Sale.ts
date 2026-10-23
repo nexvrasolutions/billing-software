@@ -33,6 +33,13 @@ export interface ISaleItem {
    Sale
 ========================= */
 
+export interface ISalePaymentComponent {
+    method: "cash" | "bank" | "upi" | "card";
+    amount: number;
+    referenceNo?: string;
+    notes?: string;
+}
+
 export interface ISale extends Document {
     tenantId: mongoose.Types.ObjectId;
 
@@ -40,6 +47,7 @@ export interface ISale extends Document {
     operationId?: string;
 
     invoiceNo: string;
+    provisionalInvoiceNo?: string;
 
     customerId?: mongoose.Types.ObjectId;
 
@@ -84,6 +92,8 @@ export interface ISale extends Document {
     | "upi"
     | "card"
     | "credit";
+
+    payments?: ISalePaymentComponent[];
 
     status: "draft" | "completed" | "cancelled";
 
@@ -204,6 +214,13 @@ const SaleSchema = new Schema<ISale>(
             uppercase: true,
         },
 
+        provisionalInvoiceNo: {
+            type: String,
+            trim: true,
+            uppercase: true,
+            index: true,
+        },
+
         customerId: {
             type: Schema.Types.ObjectId,
             ref: "Customer",
@@ -321,6 +338,29 @@ const SaleSchema = new Schema<ISale>(
             type: String,
             enum: ["cash", "bank", "upi", "card", "credit"],
         },
+
+        payments: [
+            {
+                method: {
+                    type: String,
+                    enum: ["cash", "bank", "upi", "card"],
+                    required: true,
+                },
+                amount: {
+                    type: Number,
+                    required: true,
+                    min: 0.01,
+                },
+                referenceNo: {
+                    type: String,
+                    trim: true,
+                },
+                notes: {
+                    type: String,
+                    trim: true,
+                },
+            },
+        ],
 
         status: {
             type: String,

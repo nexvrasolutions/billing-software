@@ -16,6 +16,7 @@
  */
 
 import { loadEnvConfig } from "@next/env";
+import { assertTestDatabaseUri } from "./lib/testDatabaseGuard";
 
 loadEnvConfig(process.cwd());
 
@@ -61,6 +62,8 @@ async function main() {
             "Set ALLOW_USER_MANAGEMENT_TESTS=YES after confirming MONGODB_URI is a development database."
         );
     }
+    // Only the dedicated test database, checked before anything connects.
+    assertTestDatabaseUri(process.env.MONGODB_URI);
 
     // Load modules after the environment is ready.
     const mongoose = (await import("mongoose")).default;

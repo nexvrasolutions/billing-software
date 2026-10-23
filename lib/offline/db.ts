@@ -51,11 +51,137 @@ export interface SyncQueueItem {
 
     // When the item entered SYNCING (to detect interrupted syncs).
     syncingSince?: string;
+
+    // Operation IDs that must be SYNCED before this item can be processed.
+    dependsOn?: string[];
 }
 
 export interface MetaRecord {
     key: string;
     value: unknown;
+}
+
+export interface CachedProductRecord {
+    // Unique key in table: `${tenantId}:${productId}` for multi-tenant safety
+    id: string;
+
+    // Original product ID from server (e.g. MongoDB _id or SKU), or local client UUID if pending
+    productId: string;
+
+    // Tenant boundary: queries are strictly filtered by this
+    tenantId: string;
+
+    name: string;
+    SKU: string;
+    barcode?: string;
+    categoryId?: string;
+    unitId?: string;
+
+    sellingPrice: number;
+    stockQuantity?: number;
+
+    status: "active" | "inactive";
+
+    taxRate?: number;
+    hsnCode?: string;
+
+    // ISO timestamp when this record was cached
+    cachedAt: string;
+
+    // Offline product creation sync status (PENDING, SYNCED, or NEEDS_ATTENTION)
+    syncStatus?: "PENDING" | "SYNCED" | "NEEDS_ATTENTION";
+
+    // Operation ID of the corresponding SyncQueueItem
+    operationId?: string;
+
+    // Error message if sync failed and needs attention
+    errorMessage?: string;
+
+    // Opening stock recorded at creation time
+    initialStock?: number;
+    openingStockOperationId?: string;
+}
+
+export interface CachedCustomerRecord {
+    // Unique key in table: `${tenantId}:${customerId}` for multi-tenant safety
+    id: string;
+
+    // Original customer ID from server (e.g. MongoDB _id), or local client UUID if pending (e.g. `cust_${uuid}`)
+    customerId: string;
+
+    // Tenant boundary: queries are strictly filtered by this
+    tenantId: string;
+
+    name: string;
+    phone?: string;
+    email?: string;
+    address?: string;
+
+    status: "active" | "inactive";
+
+    // ISO timestamp when this record was cached
+    cachedAt: string;
+
+    // Offline customer creation sync status (PENDING, SYNCED, or NEEDS_ATTENTION)
+    syncStatus?: "PENDING" | "SYNCED" | "NEEDS_ATTENTION";
+
+    // Operation ID of the corresponding SyncQueueItem
+    operationId?: string;
+
+    // Error message if sync failed and needs attention
+    errorMessage?: string;
+}
+
+export interface CachedSupplierRecord {
+    // Unique key in table: `${tenantId}:${supplierId}` for multi-tenant safety
+    id: string;
+
+    // Original supplier ID from server (e.g. MongoDB _id), or local client UUID if pending (e.g. `sup_${uuid}`)
+    supplierId: string;
+
+    // Tenant boundary: queries are strictly filtered by this
+    tenantId: string;
+
+    // Assigned sequential supplier code (e.g. "SUP-0001") or temporary code ("SUP-TEMP-...")
+    supplierCode?: string;
+
+    name: string;
+    contactPerson?: string;
+    phone?: string;
+    altPhone?: string;
+    email?: string;
+    website?: string;
+    address?: string;
+    line1?: string;
+    line2?: string;
+    city?: string;
+    state?: string;
+    pincode?: string;
+    country?: string;
+
+    gstin?: string;
+    pan?: string;
+
+    paymentType?: "cash" | "credit";
+    creditDays?: number;
+    creditLimit?: number;
+
+    category?: string;
+    notes?: string;
+
+    status: "active" | "inactive" | "blocked";
+
+    // ISO timestamp when this record was cached
+    cachedAt: string;
+
+    // Offline supplier creation/update sync status (PENDING, SYNCED, or NEEDS_ATTENTION)
+    syncStatus?: "PENDING" | "SYNCED" | "NEEDS_ATTENTION";
+
+    // Operation ID of the corresponding SyncQueueItem
+    operationId?: string;
+
+    // Error message if sync failed and needs attention
+    errorMessage?: string;
 }
 
 // Key of the last server-confirmed identity in the meta table.
@@ -65,6 +191,9 @@ export class OfflineDatabase extends Dexie {
     syncQueue!: Table<SyncQueueItem, number>;
     meta!: Table<MetaRecord, string>;
     offlineSessions!: Table<OfflineSessionRecord, string>;
+    cachedProducts!: Table<CachedProductRecord, string>;
+    cachedCustomers!: Table<CachedCustomerRecord, string>;
+    cachedSuppliers!: Table<CachedSupplierRecord, string>;
 
     constructor() {
         super("billing_offline_db");
@@ -92,7 +221,7 @@ export class OfflineDatabase extends Dexie {
                 });
             });
 
-        // Version 3: PIN-protected offline sessions (one per tenant + user +
+        // Version 3: offline sessions (one per tenant + user +
         // device). Only a new table: existing tables and queued operations
         // are kept exactly as they are (no upgrade function).
         this.version(3).stores({
@@ -100,7 +229,41 @@ export class OfflineDatabase extends Dexie {
             meta: "key",
             offlineSessions: "key",
         });
+
+        // Version 4: offline product catalogue cache (isolated by tenant).
+        // Only a new table: existing tables and queued operations
+        // are kept exactly as they are (no upgrade function).
+        this.version(4).stores({
+            syncQueue: "++id, operationId, status, localSeq, createdAt, ownerUserId",
+            meta: "key",
+            offlineSessions: "key",
+            cachedProducts: "id, tenantId, SKU, barcode, status",
+        });
+
+        // Version 5: offline customer cache (isolated by tenant).
+        // Only a new table: existing tables and queued operations
+        // are kept exactly as they are (no upgrade function).
+        this.version(5).stores({
+            syncQueue: "++id, operationId, status, localSeq, createdAt, ownerUserId",
+            meta: "key",
+            offlineSessions: "key",
+            cachedProducts: "id, tenantId, SKU, barcode, status",
+            cachedCustomers: "id, tenantId, customerId, name, phone, status",
+        });
+
+        // Version 6: offline supplier cache (isolated by tenant).
+        // Only a new table: existing tables and queued operations
+        // are kept exactly as they are (no upgrade function).
+        this.version(6).stores({
+            syncQueue: "++id, operationId, status, localSeq, createdAt, ownerUserId",
+            meta: "key",
+            offlineSessions: "key",
+            cachedProducts: "id, tenantId, SKU, barcode, status",
+            cachedCustomers: "id, tenantId, customerId, name, phone, status",
+            cachedSuppliers: "id, tenantId, supplierId, supplierCode, name, phone, status",
+        });
     }
 }
 
 export const offlineDB = new OfflineDatabase();
+

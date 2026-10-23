@@ -74,6 +74,8 @@ export interface ISupplier extends Document {
 
     createdBy?: mongoose.Types.ObjectId;
 
+    operationId?: string;
+
     createdAt: Date;
     updatedAt: Date;
 }
@@ -318,9 +320,31 @@ const SupplierSchema = new Schema<ISupplier>(
             type: Schema.Types.ObjectId,
             ref: "User",
         },
+
+        operationId: {
+            type: String,
+            trim: true,
+        },
     },
     {
         timestamps: true,
+    }
+);
+
+
+/*
+ * Prevents duplicate supplier creation from retried sync operations.
+ */
+SupplierSchema.index(
+    {
+        tenantId: 1,
+        operationId: 1,
+    },
+    {
+        unique: true,
+        partialFilterExpression: {
+            operationId: { $type: "string", $gt: "" },
+        },
     }
 );
 

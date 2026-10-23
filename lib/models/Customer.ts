@@ -10,6 +10,8 @@ export interface ICustomer extends Document {
 
     status: "active" | "inactive";
 
+    operationId?: string;
+
     createdAt: Date;
     updatedAt: Date;
 }
@@ -50,6 +52,11 @@ const CustomerSchema = new Schema<ICustomer>(
             enum: ["active", "inactive"],
             default: "active",
         },
+
+        operationId: {
+            type: String,
+            trim: true,
+        },
     },
     {
         timestamps: true,
@@ -61,6 +68,19 @@ CustomerSchema.index(
     {
         unique: true,
         sparse: true,
+        partialFilterExpression: {
+            phone: { $type: "string", $gt: "" },
+        },
+    }
+);
+
+CustomerSchema.index(
+    { tenantId: 1, operationId: 1 },
+    {
+        unique: true,
+        partialFilterExpression: {
+            operationId: { $type: "string", $gt: "" },
+        },
     }
 );
 

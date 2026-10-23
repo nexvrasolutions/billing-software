@@ -3,35 +3,45 @@ import { NextRequest, NextResponse } from "next/server";
 import mongoose from "mongoose";
 import { z } from "zod";
 
+import { connectDB } from "@/lib/db/mongodb";
 import { Product } from "@/lib/models/Product";
 import { AuditLogService } from "@/lib/services/AuditLogService";
-import { getAuthenticatedContext } from "@/lib/auth/getAuthenticatedContext";
-import { hasPermission } from "@/lib/auth/hasPermission";
+import { getAuthenticatedContext, AuthenticatedContext } from "@/lib/auth/getAuthenticatedContext";
+import { hasPermission, getGrantedPermissions } from "@/lib/auth/hasPermission";
+import {
+    PRODUCT_COST_PERMISSIONS,
+    hasCostPermission,
+    filterProductFields,
+} from "@/lib/catalog/productProjection";
 
 type RouteContext = {
     params: Promise<{ id: string }>;
 };
 
-const updateProductSchema = z.object({
-    name: z.string().trim().min(1).max(200).optional(),
-    SKU: z.string().trim().min(1).max(100).optional(),
-    barcode: z.string().trim().max(100).optional(),
-    purchasePrice: z.number().finite().min(0).optional(),
-    sellingPrice: z.number().finite().min(0).optional(),
-    status: z.enum(["active", "inactive"]).optional(),
-}).strict().refine(
-    (data) => Object.keys(data).length > 0,
-    "Provide at least one field to update"
-);
+export type ProductGetRouteDeps = {
+    getAuthContext?: (req: NextRequest) => Promise<AuthenticatedContext | null>;
+    checkPermission?: (input: { userId: string; tenantId: string; roleId?: string; permission: string }) => Promise<boolean>;
+    fetchGrantedPermissions?: (input: { userId: string; tenantId: string; roleId?: string; permissions: string[] }) => Promise<Set<string>>;
+    findProduct?: (id: string, tenantId: string, includeCost: boolean) => Promise<unknown>;
+    connectToDatabase?: () => Promise<void>;
+};
+
+import { updateProductSchema } from "@/lib/validations/product";
 
 // GET PRODUCT
 export async function GET(
     request: NextRequest,
-    context: RouteContext
+    context: RouteContext,
+    deps: ProductGetRouteDeps = {}
 ) {
     try {
+        const authFn = deps.getAuthContext ?? getAuthenticatedContext;
+        const checkPermFn = deps.checkPermission ?? hasPermission;
+        const grantedPermsFn = deps.fetchGrantedPermissions ?? getGrantedPermissions;
+        const connectFn = deps.connectToDatabase ?? connectDB;
+
         // 1. Verify authentication and obtain the tenant context.
-        const auth = await getAuthenticatedContext(request);
+        const auth = await authFn(request);
 
         if (!auth) {
             return NextResponse.json(
@@ -44,7 +54,7 @@ export async function GET(
         }
 
         // 2. Check product-read permission.
-        const canReadProducts = await hasPermission({
+        const canReadProducts = await checkPermFn({
             userId: auth.userId,
             tenantId: auth.tenantId,
             roleId: auth.roleId,
@@ -61,7 +71,29 @@ export async function GET(
             );
         }
 
-        // 3. Validate the product ID.
+        // 3. Check purchase-cost authorization if requested.
+        const includeCost = request.nextUrl.searchParams.get("includeCost") === "true";
+
+        if (includeCost) {
+            const granted = await grantedPermsFn({
+                userId: auth.userId,
+                tenantId: auth.tenantId,
+                roleId: auth.roleId,
+                permissions: [...PRODUCT_COST_PERMISSIONS],
+            });
+
+            if (!hasCostPermission(granted)) {
+                return NextResponse.json(
+                    {
+                        success: false,
+                        message: "You do not have permission to view product purchase costs",
+                    },
+                    { status: 403 }
+                );
+            }
+        }
+
+        // 4. Validate the product ID.
         const { id } = await context.params;
 
         if (!mongoose.Types.ObjectId.isValid(id)) {
@@ -74,13 +106,29 @@ export async function GET(
             );
         }
 
-        // 4. Find the product within the authenticated tenant only.
-        const product = await Product.findOne({
-            _id: new mongoose.Types.ObjectId(id),
-            tenantId: new mongoose.Types.ObjectId(auth.tenantId),
-        }).lean();
+        await connectFn();
 
-        if (!product) {
+        // 5. Find the product within the authenticated tenant only.
+        let rawProduct: unknown;
+
+        if (deps.findProduct) {
+            rawProduct = await deps.findProduct(id, auth.tenantId, includeCost);
+        } else {
+            const query = Product.findOne({
+                _id: new mongoose.Types.ObjectId(id),
+                tenantId: new mongoose.Types.ObjectId(auth.tenantId),
+            });
+
+            if (!includeCost) {
+                query.select("-purchasePrice -__v");
+            } else {
+                query.select("-__v");
+            }
+
+            rawProduct = await query.lean();
+        }
+
+        if (!rawProduct) {
             return NextResponse.json(
                 {
                     success: false,
@@ -89,6 +137,8 @@ export async function GET(
                 { status: 404 }
             );
         }
+
+        const product = filterProductFields(rawProduct, includeCost);
 
         return NextResponse.json({
             success: true,
@@ -215,10 +265,18 @@ export async function PUT(
             purchasePrice: product.purchasePrice,
             sellingPrice: product.sellingPrice,
             stockQuantity: product.stockQuantity,
+            taxRate: product.taxRate,
+            hsnCode: product.hsnCode,
             status: product.status,
         };
 
         const newSKU = data.SKU?.toUpperCase();
+        const cleanBarcode =
+            data.barcode !== undefined
+                ? data.barcode.trim()
+                    ? data.barcode.trim().toUpperCase()
+                    : ""
+                : undefined;
 
         // 7. Check SKU and barcode conflicts within this tenant.
         const duplicateConditions: Record<string, unknown>[] = [];
@@ -228,11 +286,11 @@ export async function PUT(
         }
 
         if (
-            data.barcode !== undefined &&
-            data.barcode !== product.barcode &&
-            data.barcode !== ""
+            cleanBarcode !== undefined &&
+            cleanBarcode !== "" &&
+            cleanBarcode !== product.barcode?.toUpperCase()
         ) {
-            duplicateConditions.push({ barcode: data.barcode });
+            duplicateConditions.push({ barcode: cleanBarcode });
         }
 
         if (duplicateConditions.length > 0) {
@@ -262,11 +320,11 @@ export async function PUT(
             product.SKU = newSKU;
         }
 
-        if (data.barcode !== undefined) {
-            if (data.barcode === "") {
+        if (cleanBarcode !== undefined) {
+            if (cleanBarcode === "") {
                 product.barcode = undefined;
             } else {
-                product.barcode = data.barcode;
+                product.barcode = cleanBarcode;
             }
         }
 
@@ -276,6 +334,18 @@ export async function PUT(
 
         if (data.sellingPrice !== undefined) {
             product.sellingPrice = data.sellingPrice;
+        }
+
+        if (data.taxRate !== undefined) {
+            product.taxRate =
+                data.taxRate === null ? undefined : data.taxRate;
+        }
+
+        if (data.hsnCode !== undefined) {
+            product.hsnCode =
+                data.hsnCode === null || data.hsnCode.trim() === ""
+                    ? undefined
+                    : data.hsnCode.trim();
         }
 
         if (data.status !== undefined) {
@@ -291,6 +361,8 @@ export async function PUT(
             purchasePrice: product.purchasePrice,
             sellingPrice: product.sellingPrice,
             stockQuantity: product.stockQuantity,
+            taxRate: product.taxRate,
+            hsnCode: product.hsnCode,
             status: product.status,
         };
 

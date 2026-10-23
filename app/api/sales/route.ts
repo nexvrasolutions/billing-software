@@ -9,6 +9,41 @@ import {
     SALE_DATE_RULES,
     getGrantedBusinessPermissions,
 } from "@/lib/auth/businessPermissions";
+import { publicErrorMessage } from "@/lib/api/publicError";
+
+import { connectDB } from "@/lib/db/mongodb";
+import { Sale } from "@/lib/models/Sale";
+
+export async function GET(request: NextRequest) {
+    try {
+        const context = await getAuthenticatedContext(request);
+        if (!context) {
+            return NextResponse.json(
+                { success: false, message: "Authentication required" },
+                { status: 401 }
+            );
+        }
+
+        await connectDB();
+        const sales = await Sale.find({
+            tenantId: new mongoose.Types.ObjectId(context.tenantId),
+        })
+            .sort({ createdAt: -1 })
+            .limit(100)
+            .lean();
+
+        return NextResponse.json({
+            success: true,
+            sales,
+        });
+    } catch (error) {
+        console.error("GET SALES ERROR:", error);
+        return NextResponse.json(
+            { success: false, message: "Failed to load sales" },
+            { status: 500 }
+        );
+    }
+}
 
 export async function POST(
     request: NextRequest
@@ -93,9 +128,7 @@ export async function POST(
             {
                 success: false,
                 message:
-                    error instanceof Error
-                        ? error.message
-                        : "Failed to create sale",
+                    publicErrorMessage(error, "Failed to create sale"),
             },
             { status: error instanceof BusinessPermissionError ? 403 : 400 }
         );

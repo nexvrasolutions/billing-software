@@ -8,8 +8,10 @@
  *         brand-new temporary tenants (with their own products, sales, stock
  *         movements, ...) that are removed afterwards by runTestSafely.
  *
- * Run:
- *   ALLOW_OFFLINE_SYNC_TESTS=YES npx tsx scripts/test-offline-sync.ts
+ * Run (NODE_ENV=test loads only .env.test.local, never .env.local; the
+ * database must be exactly "billing_test" or the script refuses before
+ * connecting):
+ *   NODE_ENV=test ALLOW_OFFLINE_SYNC_TESTS=YES npx tsx scripts/test-offline-sync.ts
  */
 
 import { loadEnvConfig } from "@next/env";
@@ -38,11 +40,54 @@ function summarize(): boolean {
     return failed.length === 0;
 }
 
+/** The only database these tests may use. */
+const TEST_DATABASE_NAME = "billing_test";
+
+/**
+ * Database-name guard (same rule as scripts/test-offline-sync-browser.ts).
+ * Runs BEFORE any database module is loaded or any connection is made. The
+ * test only runs against the database named exactly "billing_test"
+ * (TEST_DATABASE_NAME, case-sensitive like MongoDB), so it cannot touch the
+ * normal application database or any other database by accident. It fails
+ * closed: a missing, unparseable or unnamed URI is refused too. Neither the
+ * URI, the credentials nor the database name found in it ever appear in a
+ * message.
+ *
+ * The name is the first path segment of a mongodb:// or mongodb+srv:// URI
+ * (reserved characters in credentials must be percent-encoded, as MongoDB
+ * requires; anything else simply fails to parse and is refused).
+ */
+function assertDedicatedTestDatabase(uri: string | undefined): void {
+    const refuse = (): never => {
+        throw new Error(
+            `Refusing to run: MONGODB_URI must name the dedicated test database ${TEST_DATABASE_NAME}. ` +
+            "Nothing was connected to or written."
+        );
+    };
+
+    if (!uri) return refuse();
+
+    const match = /^mongodb(?:\+srv)?:\/\/([^/?#]+)\/([^/?#]*)/i.exec(uri.trim());
+    if (!match) return refuse();
+
+    let name: string;
+    try {
+        name = decodeURIComponent(match[2]);
+    } catch {
+        return refuse();
+    }
+
+    // Exactly the test database: not another "*_test" database, not a
+    // name that merely contains it.
+    if (name !== TEST_DATABASE_NAME) return refuse();
+}
+
 async function main() {
     if (process.env.NODE_ENV === "production") throw new Error("Refusing to run in production.");
     if (process.env.ALLOW_OFFLINE_SYNC_TESTS !== "YES") {
         throw new Error("Set ALLOW_OFFLINE_SYNC_TESTS=YES after confirming MONGODB_URI is a development database.");
     }
+    assertDedicatedTestDatabase(process.env.MONGODB_URI);
 
     const mongoose = (await import("mongoose")).default;
     const { NextRequest } = await import("next/server");

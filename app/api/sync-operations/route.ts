@@ -11,28 +11,10 @@ import {
     getSyncEntityPermission,
 } from "@/lib/auth/businessPermissions";
 
-const objectIdSchema = z.string().regex(/^[a-f\d]{24}$/i, "Invalid ID");
+import { uploadSchema, normalizeSupplierUpdatePayload } from "@/lib/validations/syncOperations";
 
 // Payloads are validated in detail when processed; here only shape and size.
 const MAX_PAYLOAD_BYTES = 100_000;
-
-const uploadSchema = z.strictObject({
-    // Generated on the device with crypto.randomUUID().
-    operationId: z.uuid("operationId must be a UUID"),
-    // Processing always creates records, so only CREATE is accepted.
-    operationType: z.literal("CREATE"),
-    // Only entity types the server can actually process.
-    entityType: z.enum(["Sale", "Purchase", "SalesReturn", "PurchaseReturn", "Payment", "StockAdjustment"]),
-    entityId: objectIdSchema.optional(),
-    payload: z.record(z.string(), z.unknown()),
-    // The account that queued the operation on the device. It is only
-    // compared with the session: identity is always taken from the session.
-    owner: z.strictObject({
-        tenantId: objectIdSchema,
-        userId: objectIdSchema,
-        deviceId: objectIdSchema,
-    }),
-});
 
 function errorJson(error: SyncProcessError) {
     return NextResponse.json(error.toJSON(), { status: error.httpStatus });
@@ -55,6 +37,21 @@ export async function POST(request: NextRequest) {
             body = await request.json();
         } catch {
             return errorJson(new SyncProcessError(400, "INVALID_REQUEST", "Request body must be valid JSON", false));
+        }
+
+        // Narrow compatibility fix: normalize harmless status: "active" on legacy Supplier UPDATE
+        if (
+            body &&
+            typeof body === "object" &&
+            (body as any).entityType === "Supplier" &&
+            (body as any).operationType === "UPDATE" &&
+            (body as any).payload &&
+            typeof (body as any).payload === "object"
+        ) {
+            body = {
+                ...(body as any),
+                payload: normalizeSupplierUpdatePayload((body as any).payload),
+            };
         }
 
         const parsed = uploadSchema.safeParse(body);
@@ -139,7 +136,11 @@ export async function POST(request: NextRequest) {
                 operationId: input.operationId,
                 operationType: input.operationType,
                 entityType: input.entityType,
-                entityId: input.entityId ? new mongoose.Types.ObjectId(input.entityId) : undefined,
+                entityId: input.entityId
+                    ? new mongoose.Types.ObjectId(input.entityId)
+                    : (input.operationType === "UPDATE" && "customerId" in input.payload && typeof input.payload.customerId === "string"
+                        ? new mongoose.Types.ObjectId(input.payload.customerId)
+                        : undefined),
                 payload: input.payload,
                 status: "PENDING",
                 attempts: 0,

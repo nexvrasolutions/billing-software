@@ -2,19 +2,31 @@
 
 import {
     useCallback,
+    useRef,
     useState,
 } from "react";
 
 import {
     addToSyncQueue,
     getQueueItemsForOwner,
-    deleteSyncQueueItem,
 } from "@/lib/offline/SyncQueueService";
 import { fetchSessionIdentity } from "@/lib/offline/sessionIdentity";
 
 import { syncPendingOperations } from "@/lib/offline/SyncManager";
 
 import { useOnlineStatus } from "@/lib/offline/useOnlineStatus";
+import {
+    CATEGORY_LABELS,
+    attentionAdvice,
+    categorize,
+    describeAfterRun,
+    describeRunReason,
+    describeUnsynced,
+    safeReason,
+    summarizeQueue,
+} from "@/lib/offline/queueStatus";
+import type { SyncQueueItem } from "@/lib/offline/db";
+import { describeQueueWriteError } from "@/lib/offline/storageDurability";
 
 export default function OfflineTestPage() {
     const [message, setMessage] = useState("");
@@ -36,15 +48,22 @@ export default function OfflineTestPage() {
 
                 if (!results.ran) {
                     setMessage(
-                        `Sync skipped: ${results.reason}.`
+                        `Sync skipped: ${results.reason}. ${describeRunReason(results.reason)}`.trim()
                     );
 
                     return;
                 }
 
+                const after =
+                    describeAfterRun(results.remaining, results.reason);
+
                 if (results.results.length === 0) {
+                    // "Nothing sent" is not "nothing waiting": items may be
+                    // waiting for their retry time or need attention.
                     setMessage(
-                        "No pending operations to sync."
+                        results.remaining && results.remaining.unsynced > 0
+                            ? `No pending operations were due to send now. ${after}`
+                            : `No pending operations to sync. ${describeRunReason(results.reason)}`.trim()
                     );
 
                     return;
@@ -52,7 +71,8 @@ export default function OfflineTestPage() {
 
                 setMessage(
                     `Sync completed. ${results.results.length} operation(s) processed: ` +
-                    results.results.map((r) => r.status).join(", ")
+                    results.results.map((r) => CATEGORY_LABELS[categorize(r.status)]).join(", ") +
+                    `. ${after}`
                 );
             } catch (error) {
                 console.error(
@@ -71,52 +91,98 @@ export default function OfflineTestPage() {
     const isOnline =
         useOnlineStatus(syncOperations);
 
+    // Test sale details. A valid Product ID from the signed-in tenant is
+    // required to queue an offline test sale. Customer ID is optional.
+    const [productId, setProductId] = useState("");
+    const [quantity, setQuantity] = useState("1");
+    const [customerId, setCustomerId] = useState("");
+
+    // This account's queue as last read by "Check Queue" (read-only view).
+    const [queueItems, setQueueItems] = useState<SyncQueueItem[] | null>(null);
+
+    // True while a test sale is being saved to the local queue.
+    const [saving, setSaving] = useState(false);
+    const savingRef = useRef(false);
+
+    function buildPayload(): Record<string, unknown> | string {
+        const trimmedProductId = productId.trim();
+
+        if (!trimmedProductId) {
+            return "Product ID is required.";
+        }
+
+        const objectIdPattern = /^[a-f\d]{24}$/i;
+        const trimmedCustomerId = customerId.trim();
+        const parsedQuantity = Number(quantity);
+
+        if (!objectIdPattern.test(trimmedProductId)) {
+            return "Product ID must be a 24-character ID.";
+        }
+
+        if (trimmedCustomerId && !objectIdPattern.test(trimmedCustomerId)) {
+            return "Customer ID must be empty or a 24-character ID.";
+        }
+
+        if (!Number.isFinite(parsedQuantity) || parsedQuantity <= 0) {
+            return "Quantity must be a number greater than 0.";
+        }
+
+        // No unitPrice: the server uses the product's selling price, so no
+        // price-override permission is needed. No paidAmount: the total is
+        // only known on the server.
+        return {
+            invoiceNo: `OFFTEST-${Date.now()}`,
+
+            ...(trimmedCustomerId
+                ? { customerId: trimmedCustomerId }
+                : {}),
+
+            warehouse: {
+                name: "Main Warehouse",
+            },
+
+            items: [
+                {
+                    productId: trimmedProductId,
+
+                    quantity: parsedQuantity,
+                },
+            ],
+
+            paymentMethod: "cash",
+
+            notes:
+                "Controlled offline test sale",
+        };
+    }
+
     async function addTestOperation() {
+        // Each click queues a NEW operation ID, so a second click while the
+        // first sale is still being saved would record the sale twice. The
+        // ref blocks it at once; the state disables the button.
+        if (savingRef.current) {
+            return;
+        }
+
+        const payload = buildPayload();
+
+        if (typeof payload === "string") {
+            setMessage(payload);
+
+            return;
+        }
+
+        savingRef.current = true;
+        setSaving(true);
+
         try {
             // The queue generates a secure random operation ID itself.
-            // NOTE: invoice numbering for offline sales is an open design
-            // decision; this demo value can collide across devices.
-            const invoiceNo =
-                `INV - OFFLINE - BROWSER - ${Date.now()} `;
-
             const result =
                 await addToSyncQueue({
                     operationType: "CREATE",
                     entityType: "Sale",
 
-                    payload: {
-                        invoiceNo,
-
-                        customerId:
-                            "6abe4d406ae4b08a3e335467",
-
-                        warehouse: {
-                            name: "Main Warehouse",
-                            location: "Nagercoil",
-                        },
-
-                        items: [
-                            {
-                                productId:
-                                    "6abe4d406ae4b08a3e335466",
-
-                                quantity: 1,
-
-                                unitPrice: 120,
-
-                                discountRate: 0,
-
-                                taxRate: 0,
-                            },
-                        ],
-
-                        paidAmount: 120,
-
-                        paymentMethod: "cash",
-
-                        notes:
-                            "Browser automatic sync test",
-                    },
+                    payload,
 
                     localSeq: Date.now(),
                 });
@@ -127,9 +193,13 @@ export default function OfflineTestPage() {
         } catch (error) {
             console.error(error);
 
+            // Success is only ever shown after the queue write resolved.
             setMessage(
-                "Failed to add offline operation."
+                `Failed to add offline operation. ${describeQueueWriteError(error)}`
             );
+        } finally {
+            savingRef.current = false;
+            setSaving(false);
         }
     }
 
@@ -155,9 +225,22 @@ export default function OfflineTestPage() {
                 counts[operation.status] = (counts[operation.status] ?? 0) + 1;
             }
 
+            const summary =
+                summarizeQueue(operations);
+            const unsyncedText =
+                describeUnsynced(summary);
+
             setMessage(
                 `Queued operations for this account: ${operations.length} ` +
-                JSON.stringify(counts)
+                JSON.stringify(counts) +
+                (unsyncedText
+                    ? ` Not yet confirmed by the server: ${unsyncedText}.${attentionAdvice(summary)}`
+                    : "")
+            );
+
+            // Newest first; read-only view.
+            setQueueItems(
+                [...operations].reverse()
             );
         } catch (error) {
             console.error(error);
@@ -170,24 +253,6 @@ export default function OfflineTestPage() {
 
     async function manualSync() {
         await syncOperations();
-    }
-
-    async function deleteOldTestOperation() {
-        try {
-            await deleteSyncQueueItem(
-                "OP-OFFLINE-TEST-1791348653781"
-            );
-
-            setMessage(
-                "Old test operation deleted successfully."
-            );
-        } catch (error) {
-            console.error(error);
-
-            setMessage(
-                "Failed to delete old test operation."
-            );
-        }
     }
 
     return (
@@ -214,12 +279,54 @@ export default function OfflineTestPage() {
             <div
                 style={{
                     marginTop: "20px",
+                    display: "flex",
+                    flexWrap: "wrap",
+                    gap: "10px",
+                }}
+            >
+                <label>
+                    Product ID{" "}
+                    <input
+                        type="text"
+                        value={productId}
+                        onChange={(event) => setProductId(event.target.value)}
+                        placeholder="24-character product ID"
+                    />
+                </label>
+
+                <label>
+                    Quantity{" "}
+                    <input
+                        type="number"
+                        min="0"
+                        step="any"
+                        value={quantity}
+                        onChange={(event) => setQuantity(event.target.value)}
+                    />
+                </label>
+
+                <label>
+                    Customer ID (optional){" "}
+                    <input
+                        type="text"
+                        value={customerId}
+                        onChange={(event) => setCustomerId(event.target.value)}
+                    />
+                </label>
+            </div>
+
+            <div
+                style={{
+                    marginTop: "20px",
                 }}
             >
                 <button
                     onClick={addTestOperation}
+                    disabled={saving}
                 >
-                    Add Offline Test Sale
+                    {saving
+                        ? "Saving..."
+                        : "Add Offline Test Sale"}
                 </button>
 
                 <button
@@ -239,15 +346,6 @@ export default function OfflineTestPage() {
                 >
                     Sync Operations
                 </button>
-
-                <button
-                    onClick={deleteOldTestOperation}
-                    style={{
-                        marginLeft: "10px",
-                    }}
-                >
-                    Delete Old Test
-                </button>
             </div>
 
             <p
@@ -257,6 +355,52 @@ export default function OfflineTestPage() {
             >
                 {message}
             </p>
+
+            {/* No paragraph elements below: the message above must stay
+                the page's last paragraph (the browser test resets it). */}
+            {queueItems && queueItems.length > 0 && (
+                <table
+                    style={{
+                        marginTop: "20px",
+                        borderCollapse: "collapse",
+                        fontSize: "14px",
+                    }}
+                >
+                    <caption style={{ textAlign: "left", fontWeight: 600 }}>
+                        This account&apos;s operations on this device (newest first)
+                    </caption>
+                    <thead>
+                        <tr>
+                            {["Queued at", "Invoice", "Status", "Attempts", "Next try", "Reason"].map((heading) => (
+                                <th key={heading} style={{ textAlign: "left", padding: "4px 8px", borderBottom: "1px solid #ccc" }}>
+                                    {heading}
+                                </th>
+                            ))}
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {queueItems.map((item) => {
+                            const invoice = item.payload?.invoiceNo;
+                            const nextTry = item.status === "FAILED" && item.nextAttemptAt
+                                ? new Date(item.nextAttemptAt).toLocaleString()
+                                : "";
+
+                            return (
+                                <tr key={item.operationId}>
+                                    <td style={{ padding: "4px 8px" }}>{new Date(item.createdAt).toLocaleString()}</td>
+                                    <td style={{ padding: "4px 8px" }}>{typeof invoice === "string" ? invoice : ""}</td>
+                                    <td style={{ padding: "4px 8px" }}>{CATEGORY_LABELS[categorize(item.status)]}</td>
+                                    <td style={{ padding: "4px 8px" }}>{item.attempts}</td>
+                                    <td style={{ padding: "4px 8px" }}>{nextTry}</td>
+                                    <td style={{ padding: "4px 8px" }}>
+                                        {item.status === "SYNCED" ? "" : safeReason(item.errorMessage) ?? ""}
+                                    </td>
+                                </tr>
+                            );
+                        })}
+                    </tbody>
+                </table>
+            )}
         </main>
     );
 }

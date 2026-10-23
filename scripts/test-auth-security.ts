@@ -18,6 +18,7 @@
  */
 
 import { loadEnvConfig } from "@next/env";
+import { assertTestDatabaseUri } from "./lib/testDatabaseGuard";
 import { spawnSync } from "child_process";
 import path from "path";
 
@@ -40,6 +41,8 @@ function check(name: string, condition: boolean, detail?: string) {
  * checks tokens passed via environment variables and prints only statuses.
  */
 async function childCheck() {
+    // Child mode skips main(): check the database here as well.
+    assertTestDatabaseUri(process.env.MONGODB_URI);
     const mongoose = (await import("mongoose")).default;
     const { NextRequest } = await import("next/server");
     const meRoute = await import("../app/api/auth/me/route");
@@ -67,6 +70,8 @@ async function main() {
             "Set ALLOW_AUTH_SECURITY_TESTS=YES after confirming MONGODB_URI is a development database."
         );
     }
+    // Only the dedicated test database, checked before anything connects.
+    assertTestDatabaseUri(process.env.MONGODB_URI);
 
     // Use the documented default limits; only the trusted IP header is set.
     for (const name of [
@@ -313,9 +318,9 @@ async function main() {
         check("S1. Login succeeds and sets a session cookie", s1.status === 200 && t1.length > 0);
         const setCookie = (s1.headers.get("set-cookie") ?? "").toLowerCase();
         check(
-            "S1. Cookie is HttpOnly, SameSite=Lax, Path=/, 7-day Max-Age (Secure only in production)",
+            "S1. Cookie is HttpOnly, SameSite=Lax, Path=/, 24-hour Max-Age (Secure only in production)",
             setCookie.includes("httponly") && setCookie.includes("samesite=lax") && setCookie.includes("path=/") &&
-            setCookie.includes(`max-age=${60 * 60 * 24 * 7}`) && !setCookie.includes("secure")
+            setCookie.includes(`max-age=${24 * 60 * 60}`) && !setCookie.includes("secure")
         );
         check("S1. /api/auth/me works with the session (200)", (await me(t1)).status === 200);
         check("S1. Protected API works with the session (200)", (await listUsers(t1)).status === 200);

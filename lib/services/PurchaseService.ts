@@ -151,7 +151,7 @@ export class PurchaseService {
                             }).session(session);
 
                         if (existingOperationPurchase) {
-
+                            (existingOperationPurchase as unknown as { alreadyProcessed?: boolean }).alreadyProcessed = true;
                             createdPurchase =
                                 existingOperationPurchase;
 
@@ -767,6 +767,7 @@ export class PurchaseService {
                 if (
                     existingOperationPurchase
                 ) {
+                    (existingOperationPurchase as unknown as { alreadyProcessed?: boolean }).alreadyProcessed = true;
                     return existingOperationPurchase;
                 }
             }

@@ -8,6 +8,7 @@ import {
     BUSINESS_PERMISSIONS,
     requireBusinessPermission,
 } from "@/lib/auth/businessPermissions";
+import { publicErrorMessage } from "@/lib/api/publicError";
 
 export async function POST(request: NextRequest) {
     try {
@@ -88,9 +89,7 @@ export async function POST(request: NextRequest) {
             {
                 success: false,
                 message:
-                    error instanceof Error
-                        ? error.message
-                        : "Failed to create ledger entries",
+                    publicErrorMessage(error, "Failed to create ledger entries"),
             },
             { status: 400 }
         );

@@ -33,7 +33,11 @@ import {
 } from "@/lib/services/PaymentService";
 
 import { StockService } from "./StockService";
+import { ProductSyncService } from "./ProductSyncService";
+import { CustomerSyncService } from "./CustomerSyncService";
+import { SupplierSyncService } from "./SupplierSyncService";
 import { Device } from "../models/Device";
+import { Sale } from "../models/Sale";
 import mongoose from "mongoose";
 import { SyncOperation } from "../models/SyncOperation";
 import { randomUUID } from "crypto";
@@ -42,6 +46,8 @@ import {
     SYNC_LEASE_MS,
     SyncProcessError,
     classifySyncError,
+    publicStoredSyncMessage,
+    publicSyncErrorMessage,
     statusAfterFailure,
 } from "./SyncErrors";
 
@@ -217,7 +223,7 @@ function requiredItems<T>(
 // SALE PAYLOAD
 // ============================================================
 
-function parseSalePayload(
+export function parseSalePayload(
     value: unknown
 ): CreateSaleInput {
     const p = getPayloadObject(value);
@@ -242,11 +248,17 @@ function parseSalePayload(
         );
     }
 
+    const rawInvoiceNo = optionalString(p.invoiceNo, "invoiceNo");
+    const rawProvisionalNo = optionalString(p.provisionalInvoiceNo, "provisionalInvoiceNo");
+    const effectiveInvoiceNo = rawInvoiceNo || rawProvisionalNo;
+    if (!effectiveInvoiceNo) {
+        throw new Error("Invalid or missing field: invoiceNo or provisionalInvoiceNo");
+    }
+
     return {
-        invoiceNo: requiredString(
-            p.invoiceNo,
-            "invoiceNo"
-        ),
+        invoiceNo: effectiveInvoiceNo,
+
+        provisionalInvoiceNo: rawProvisionalNo,
 
         customerId: optionalString(
             p.customerId,
@@ -289,6 +301,11 @@ function parseSalePayload(
                         `items[${index}].discountRate`
                     ),
 
+                    discountAmount: optionalNumber(
+                        item.discountAmount,
+                        `items[${index}].discountAmount`
+                    ),
+
                     taxRate: optionalNumber(
                         item.taxRate,
                         `items[${index}].taxRate`
@@ -305,6 +322,28 @@ function parseSalePayload(
         paymentMethod:
             p.paymentMethod as
             CreateSaleInput["paymentMethod"],
+
+        paymentComponents: Array.isArray(p.paymentComponents)
+            ? p.paymentComponents.map((c, i) => {
+                const comp = getPayloadObject(c);
+                const method = requiredString(comp.method, `paymentComponents[${i}].method`);
+                if (!["cash", "bank", "upi", "card"].includes(method)) {
+                    throw new Error(`Invalid payment component method: ${method}`);
+                }
+                const amount = requiredNumber(comp.amount, `paymentComponents[${i}].amount`);
+                if (amount <= 0) {
+                    throw new Error(`Payment component amount must be greater than zero`);
+                }
+                return {
+                    method: method as "cash" | "bank" | "upi" | "card",
+                    amount,
+                    referenceNo: optionalString(comp.referenceNo, `paymentComponents[${i}].referenceNo`),
+                    notes: optionalString(comp.notes, `paymentComponents[${i}].notes`),
+                };
+            })
+            : undefined,
+
+        roundOff: typeof p.roundOff === "boolean" ? p.roundOff : undefined,
 
         notes: optionalString(
             p.notes,
@@ -849,8 +888,9 @@ export class SyncService {
             throw new SyncProcessError(
                 422,
                 "NEEDS_ATTENTION",
+                // Stored text may predate sanitizing: never return it raw.
                 existingOperation.errorMessage
-                    ? `Operation needs attention: ${existingOperation.errorMessage}`
+                    ? `Operation needs attention: ${publicStoredSyncMessage(existingOperation.errorMessage)}`
                     : "Operation needs attention and will not be retried automatically",
                 false
             );
@@ -954,7 +994,22 @@ export class SyncService {
             }
 
             if (current?.status === "SYNCED") {
-                return { success: true, alreadySynced: true, operation: current };
+                let existingSale = null;
+                if (current.entityType === "Sale") {
+                    existingSale = await Sale.findOne({ tenantId: user.tenantId, operationId: current.operationId }).lean();
+                }
+                return {
+                    success: true,
+                    alreadySynced: true,
+                    operation: current,
+                    result: existingSale
+                        ? {
+                            _id: existingSale._id,
+                            invoiceNo: existingSale.invoiceNo,
+                            provisionalInvoiceNo: existingSale.provisionalInvoiceNo,
+                        }
+                        : undefined,
+                };
             }
 
             if (current?.status === "PROCESSING") {
@@ -1056,7 +1111,14 @@ export class SyncService {
             const payload = getPayloadObject(operation.payload);
 
             // 8. Idempotent business operation (see the per-entity services).
-            await SyncService.runBusinessOperation(businessUser, operation.entityType, payload, operation.operationId, salePolicy);
+            const opResult: any = await SyncService.runBusinessOperation(
+                businessUser,
+                operation.entityType,
+                payload,
+                operation.operationId,
+                salePolicy,
+                operation.operationType
+            );
 
             // 9. Mark SYNCED. Normally only the lease holder may do this. If
             //    the lease expired meanwhile and another worker reclaimed the
@@ -1066,7 +1128,11 @@ export class SyncService {
                 (await SyncOperation.findOneAndUpdate(
                     { _id: operation._id, tenantId: user.tenantId, status: "PROCESSING", leaseToken },
                     {
-                        $set: { status: "SYNCED", syncedAt: new Date() },
+                        $set: {
+                            status: "SYNCED",
+                            syncedAt: new Date(),
+                            ...(opResult?._id ? { entityId: opResult._id } : {}),
+                        },
                         $unset: { errorMessage: "", failureKind: "", leaseToken: "", leaseExpiresAt: "" },
                     },
                     { returnDocument: "after" }
@@ -1074,7 +1140,11 @@ export class SyncService {
                 (await SyncOperation.findOneAndUpdate(
                     { _id: operation._id, tenantId: user.tenantId, status: { $in: ["PROCESSING", "SYNCED"] } },
                     {
-                        $set: { status: "SYNCED", syncedAt: new Date() },
+                        $set: {
+                            status: "SYNCED",
+                            syncedAt: new Date(),
+                            ...(opResult?._id ? { entityId: opResult._id } : {}),
+                        },
                         $unset: { errorMessage: "", failureKind: "", leaseToken: "", leaseExpiresAt: "" },
                     },
                     { returnDocument: "after" }
@@ -1093,7 +1163,20 @@ export class SyncService {
                 );
             }
 
-            return { success: true, alreadySynced: false, operation: synced };
+            return {
+                success: true,
+                alreadySynced: false,
+                operation: synced,
+                result: opResult
+                    ? {
+                        _id: (opResult as any)._id,
+                        invoiceNo: (opResult as any).invoiceNo,
+                        provisionalInvoiceNo: (opResult as any).provisionalInvoiceNo,
+                        SKU: (opResult as any).SKU,
+                        name: (opResult as any).name,
+                    }
+                    : undefined,
+            };
         } catch (error: unknown) {
             if (error instanceof SyncProcessError && error.code === "RETRYABLE_FAILURE") {
                 // Leave the lease in place; it expires and the retry recovers.
@@ -1105,7 +1188,21 @@ export class SyncService {
                     ? error.retryable ? "RETRYABLE" : "PERMANENT"
                     : classifySyncError(error);
             const next = statusAfterFailure(kind, operation.attempts);
-            const errorMessage = error instanceof Error ? error.message : "Unknown sync error";
+
+            // Only sanitized text is stored on the operation and returned to
+            // the client (no database, driver or programming error detail).
+            const errorMessage = publicSyncErrorMessage(error);
+
+            if (!(error instanceof SyncProcessError)) {
+                // Server log: error class and code only, never the message
+                // (it may hold key values or infrastructure detail).
+                const errorCode = (error as { code?: unknown } | null)?.code;
+                console.error(
+                    "Sync processing error:",
+                    error instanceof Error ? error.name : "unknown",
+                    typeof errorCode === "number" || typeof errorCode === "string" ? errorCode : ""
+                );
+            }
 
             // Release the lease (only if we still hold it).
             await SyncOperation.updateOne(
@@ -1151,19 +1248,19 @@ export class SyncService {
         entityType: string,
         payload: Record<string, unknown>,
         operationId: string,
-        salePolicy: SalePolicy
+        salePolicy: SalePolicy,
+        operationType?: string
     ) {
-        const operation = { entityType, operationId };
+        const operation = { entityType, operationId, operationType };
 
         switch (operation.entityType) {
             case "Sale": {
-                await SalesService.createSale(
+                return await SalesService.createSale(
                     businessUser,
                     parseSalePayload(payload),
                     operation.operationId,
                     salePolicy
                 );
-                break;
             }
 
             case "Purchase": {
@@ -1236,20 +1333,40 @@ export class SyncService {
             }
 
             case "Customer": {
-                throw new Error(
-                    "Customer synchronization is not implemented yet"
+                if (operation.operationType === "UPDATE") {
+                    return await CustomerSyncService.updateCustomerFromSync(
+                        businessUser,
+                        payload,
+                        operation.operationId
+                    );
+                }
+                return await CustomerSyncService.createCustomerFromSync(
+                    businessUser,
+                    payload,
+                    operation.operationId
                 );
             }
 
             case "Supplier": {
-                throw new Error(
-                    "Supplier synchronization is not implemented yet"
+                if (operation.operationType === "UPDATE") {
+                    return await SupplierSyncService.updateSupplierFromSync(
+                        businessUser,
+                        payload,
+                        operation.operationId
+                    );
+                }
+                return await SupplierSyncService.createSupplierFromSync(
+                    businessUser,
+                    payload,
+                    operation.operationId
                 );
             }
 
             case "Product": {
-                throw new Error(
-                    "Product synchronization is not implemented yet"
+                return await ProductSyncService.createProductFromSync(
+                    businessUser,
+                    payload,
+                    operation.operationId
                 );
             }
 

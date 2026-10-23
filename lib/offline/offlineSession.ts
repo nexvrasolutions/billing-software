@@ -2,44 +2,58 @@
 /*
  * Offline session core (no browser storage; testable in Node).
  *
- * WHAT THIS IS: a local, PIN-protected permission to record work while the
- * device has no connection, for the account that last signed in online on
- * this device. It is NEVER authentication for the server: every upload
- * still needs a valid server session, and the server re-checks the user,
- * role, permissions, ownership and dates. A PIN is never proof of payment.
+ * WHAT THIS IS: a local permission to record work while the device has no
+ * connection, for the account (tenant + user + device) whose session was
+ * last verified by the server on this device. It needs no PIN. It is NEVER
+ * authentication for the server: every upload still needs a valid server
+ * session, and the server re-checks the user, role, permissions, ownership
+ * and dates.
  *
- * Record layout (one per tenant + user + device):
- *   - Encrypted core (AES-GCM, key = PBKDF2-SHA-256(PIN, random salt)):
- *     tenant, user and device IDs and a random nonce. The record key and
- *     nonce are bound as additional authenticated data, so a record cannot
- *     be moved to another account and any change makes decryption fail.
- *     Only a correct PIN can decrypt it; the PIN itself is never stored.
- *   - Renewable status (readable without the PIN, because it must be
- *     renewed after an online password login, when the PIN is not known):
- *     permissions reported by the server (display/convenience only), last
- *     successful online check, expiry (24 h after it), failed attempts and
- *     a clock high-water mark.
+ * Validity: 72 hours after the last SUCCESSFUL online server verification,
+ * measured from the SERVER's clock (serverTime returned by /api/auth/me).
+ * Only activateOfflineSession moves the expiry, and callers use it only
+ * after login, dashboard verification or account-page verification. Sync,
+ * queueing, queue inspection, the users page, opening the app or working
+ * offline never renew it.
  *
- * LIMITS (best effort, by design): someone with technical access to the
- * unlocked browser profile can edit IndexedDB/JavaScript (reset the attempt
- * counter, extend the status, or try PINs offline against a copied record).
- * The server-side checks are the real protection.
+ * Clock checks (best effort):
+ *  - At verification the device clock must be within 5 minutes of the
+ *    server's; otherwise the session is NOT created or renewed.
+ *  - A high-water mark of the device clock is kept in the record. It is
+ *    reset at a verified online check and raised whenever offline work is
+ *    checked or recorded (recordOfflineActivity). A clock found earlier than
+ *    the mark (beyond a small tolerance) blocks offline work until the next
+ *    online verification.
+ *
+ * Record layout (one per tenant + user + device, version 2): tenant, user
+ * and device IDs, the permissions reported by the server (checked for
+ * sales.create), the last successful online check (server time), the expiry
+ * (72 h after it), the clock high-water mark and the creation time.
+ *
+ * Records written by the earlier PIN-based version (version 1) are never
+ * treated as valid; the next successful online verification replaces them.
+ * Queued work is stored elsewhere and is never touched here.
+ *
+ * LIMITS (not tamper-proof): everything here runs in the user's browser.
+ * Someone with control of the device can set the clock back, edit
+ * IndexedDB or JavaScript, extend the expiry or forge a record. Without a
+ * PIN, anyone using the unlocked browser profile within the 72 hours can
+ * record offline work as that account. The server-side checks at upload
+ * time (session, owner, permissions, sale-date rules, idempotency) are the
+ * real protection.
  */
 
-export const OFFLINE_SESSION_TTL_MS = 24 * 60 * 60 * 1000;
-export const MAX_PIN_ATTEMPTS = 5;
-export const PIN_MIN_LENGTH = 6;
-export const PIN_MAX_LENGTH = 12;
-export const PBKDF2_ITERATIONS = 600_000;
-// Records claiming other iteration counts are rejected (no downgrade / DoS).
-const MIN_ITERATIONS = 600_000;
-const MAX_ITERATIONS = 2_000_000;
+export const OFFLINE_SESSION_TTL_MS = 72 * 60 * 60 * 1000;
 // Allowed clock difference before a backwards clock is suspected.
 export const CLOCK_SKEW_MS = 5 * 60 * 1000;
+// Largest difference between the device clock and the server clock at which
+// the offline session may be created or renewed.
+export const MAX_VERIFICATION_SKEW_MS = 5 * 60 * 1000;
 // The permission required for offline work (approved decision).
 export const OFFLINE_WORK_PERMISSION = "sales.create";
+export const OFFLINE_PRODUCT_CREATE_PERMISSION = "products.create";
 
-const RECORD_VERSION = 1;
+const RECORD_VERSION = 2;
 
 export interface OfflineIdentity {
     tenantId: string;
@@ -53,27 +67,17 @@ export interface OfflineSessionRecord {
     tenantId: string;
     userId: string;
     deviceId: string;
-    // Encrypted core.
-    salt: string;
-    iterations: number;
-    iv: string;
-    ciphertext: string;
-    nonce: string;
-    // Renewable status (best effort, see above).
+    // Permissions reported by the server at the last online check.
     permissions: string[];
+    // Server time of the last successful online verification.
     lastOnlineCheckAt: string;
     expiresAt: string;
-    failedAttempts: number;
+    // Highest device-clock time seen (see the header comment).
     clockHighWater: number;
     createdAt: string;
     displayName?: string;
-}
-
-/** Proof of an unlock in this browser tab (holds no secret). */
-export interface UnlockMarker {
-    key: string;
-    nonce: string;
-    unlockedAt: number;
+    // Device clock minus server clock at the last verification (information).
+    serverSkewMs?: number;
 }
 
 export interface OfflineSessionStore {
@@ -92,14 +96,29 @@ export type OfflineSessionState =
         expiresAt: string;
         lastOnlineCheckAt: string;
         permissions: string[];
-        failedAttempts: number;
         displayName?: string;
     };
 
-export type UnlockResult =
-    | { ok: true; marker: UnlockMarker; expiresAt: string }
-    | { ok: false; reason: "none" | "invalid" | "expired" | "clock-rollback" | "locked-out" }
-    | { ok: false; reason: "wrong-pin"; remainingAttempts: number };
+export type VerificationClock =
+    | { ok: true; serverTime: number; skewMs: number }
+    | { ok: false; reason: "no-server-time" | "clock-skew"; skewMs?: number };
+
+/** Why an online verification could not create or renew the session. */
+export class OfflineVerificationError extends Error {
+    reason: "no-server-time" | "clock-skew";
+    skewMs?: number;
+
+    constructor(reason: "no-server-time" | "clock-skew", skewMs?: number) {
+        super(
+            reason === "no-server-time"
+                ? "The server did not report its time"
+                : "The device clock differs from the server clock by more than 5 minutes"
+        );
+        this.name = "OfflineVerificationError";
+        this.reason = reason;
+        this.skewMs = skewMs;
+    }
+}
 
 const ID_PATTERN = /^[a-f\d]{24}$/i;
 
@@ -116,90 +135,20 @@ function isIdentity(value: OfflineIdentity | null | undefined): value is Offline
     );
 }
 
-// --------------------------------------------------------------- PIN rules
-
-function isTrivialPin(pin: string): boolean {
-    // All digits the same (000000, 777777).
-    if (/^(\d)\1+$/.test(pin)) return true;
-
-    // Straight ascending or descending runs (123456, 987654, 012345).
-    const digits = [...pin].map(Number);
-    const steps = digits.slice(1).map((d, i) => d - digits[i]);
-    if (steps.every((s) => s === 1) || steps.every((s) => s === -1)) return true;
-
-    // A short block repeated (121212, 123123, 1212121212).
-    for (let size = 1; size <= 4; size++) {
-        if (pin.length % size === 0 && pin.length > size && pin === pin.slice(0, size).repeat(pin.length / size)) {
-            return true;
-        }
+/**
+ * Compare the device clock with the server time reported by a successful
+ * online verification. Not ok when the server time is missing or the
+ * difference is more than MAX_VERIFICATION_SKEW_MS.
+ */
+export function checkVerificationClock(serverTime: number | null | undefined, now: number): VerificationClock {
+    if (typeof serverTime !== "number" || !Number.isFinite(serverTime)) {
+        return { ok: false, reason: "no-server-time" };
     }
-
-    // Other very common PINs.
-    const common = new Set([
-        "112233", "111222", "121314", "123321", "654321", "159753", "147258",
-        "258369", "789456", "456789", "102030", "100200", "696969", "131313",
-        "520520", "123654", "147852", "142536", "246810", "135790", "000111",
-    ]);
-    return common.has(pin);
-}
-
-/** null when acceptable, otherwise the reason in plain language. */
-export function validatePin(pin: unknown): string | null {
-    if (typeof pin !== "string" || !/^\d+$/.test(pin)) {
-        return "The PIN must contain digits only.";
+    const skewMs = now - serverTime;
+    if (Math.abs(skewMs) > MAX_VERIFICATION_SKEW_MS) {
+        return { ok: false, reason: "clock-skew", skewMs };
     }
-    if (pin.length < PIN_MIN_LENGTH) {
-        return `The PIN must have at least ${PIN_MIN_LENGTH} digits.`;
-    }
-    if (pin.length > PIN_MAX_LENGTH) {
-        return `The PIN must have at most ${PIN_MAX_LENGTH} digits.`;
-    }
-    if (isTrivialPin(pin)) {
-        return "This PIN is too easy to guess. Avoid repeated digits, sequences and common PINs.";
-    }
-    return null;
-}
-
-// ------------------------------------------------------------------ crypto
-
-function subtle(): SubtleCrypto {
-    const api = globalThis.crypto?.subtle;
-    if (!api) throw new Error("Secure cryptography is not available in this browser");
-    return api;
-}
-
-function randomBytes(length: number): Uint8Array<ArrayBuffer> {
-    return globalThis.crypto.getRandomValues(new Uint8Array(new ArrayBuffer(length)));
-}
-
-function toBase64(bytes: Uint8Array): string {
-    let binary = "";
-    bytes.forEach((byte) => { binary += String.fromCharCode(byte); });
-    return btoa(binary);
-}
-
-function fromBase64(value: string): Uint8Array<ArrayBuffer> {
-    const binary = atob(value);
-    const bytes = new Uint8Array(new ArrayBuffer(binary.length));
-    for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
-    return bytes;
-}
-
-const encoder = new TextEncoder();
-
-async function deriveKey(pin: string, salt: Uint8Array<ArrayBuffer>, iterations: number): Promise<CryptoKey> {
-    const material = await subtle().importKey("raw", encoder.encode(pin), "PBKDF2", false, ["deriveKey"]);
-    return subtle().deriveKey(
-        { name: "PBKDF2", hash: "SHA-256", salt, iterations },
-        material,
-        { name: "AES-GCM", length: 256 },
-        false,
-        ["encrypt", "decrypt"]
-    );
-}
-
-function additionalData(key: string, nonce: string) {
-    return encoder.encode(`billing-offline-session:v${RECORD_VERSION}:${key}:${nonce}`);
+    return { ok: true, serverTime, skewMs };
 }
 
 // ------------------------------------------------------------ validation
@@ -213,11 +162,7 @@ function isWellFormed(record: OfflineSessionRecord, identity: OfflineIdentity): 
         r.tenantId !== identity.tenantId ||
         r.userId !== identity.userId ||
         r.deviceId !== identity.deviceId ||
-        typeof r.salt !== "string" || typeof r.iv !== "string" ||
-        typeof r.ciphertext !== "string" || typeof r.nonce !== "string" ||
-        typeof r.iterations !== "number" || r.iterations < MIN_ITERATIONS || r.iterations > MAX_ITERATIONS ||
         !Array.isArray(r.permissions) || !r.permissions.every((p) => typeof p === "string") ||
-        typeof r.failedAttempts !== "number" || r.failedAttempts < 0 || r.failedAttempts >= MAX_PIN_ATTEMPTS ||
         typeof r.clockHighWater !== "number" || !Number.isFinite(r.clockHighWater)
     ) {
         return false;
@@ -225,7 +170,7 @@ function isWellFormed(record: OfflineSessionRecord, identity: OfflineIdentity): 
 
     const lastCheck = Date.parse(String(r.lastOnlineCheckAt));
     const expires = Date.parse(String(r.expiresAt));
-    // The expiry must be exactly 24 h after the last online check.
+    // The expiry must be exactly 72 h after the last online check.
     return Number.isFinite(lastCheck) && Number.isFinite(expires) && expires - lastCheck === OFFLINE_SESSION_TTL_MS;
 }
 
@@ -236,56 +181,58 @@ function clockMovedBack(record: OfflineSessionRecord, now: number): boolean {
     );
 }
 
+function cleanPermissions(permissions: string[]): string[] {
+    return [...new Set(permissions.filter((p) => typeof p === "string"))];
+}
+
 // ------------------------------------------------------------------ API
 
 /**
- * Create (or replace) the offline session of an identity. The caller MUST
- * have just confirmed with the server that this identity's session is
- * valid, that no temporary password is pending and that the user holds
- * OFFLINE_WORK_PERMISSION.
+ * Create the offline session of an identity, or renew it (72 h from the
+ * SERVER time) and refresh its permissions. The caller MUST have just
+ * received a successful server verification of this identity's session with
+ * no temporary password pending, and MUST only call this after login,
+ * dashboard verification or account-page verification.
+ *
+ * Throws OfflineVerificationError (and changes nothing) when the server time
+ * is missing or the device clock differs from it by more than five minutes.
+ * A record left by the earlier PIN-based version, or a damaged one, is
+ * replaced. Returns the stored record.
  */
-export async function createOfflineSession(
+export async function activateOfflineSession(
     store: OfflineSessionStore,
-    input: { identity: OfflineIdentity; pin: string; permissions: string[]; displayName?: string; now: number }
+    input: { identity: OfflineIdentity; permissions: string[]; displayName?: string; now: number; serverTime: number | null | undefined }
 ): Promise<OfflineSessionRecord> {
     if (!isIdentity(input.identity)) throw new Error("A valid account and device are required");
-    const pinProblem = validatePin(input.pin);
-    if (pinProblem) throw new Error(pinProblem);
+
+    const clock = checkVerificationClock(input.serverTime, input.now);
+    if (!clock.ok) throw new OfflineVerificationError(clock.reason, clock.skewMs);
 
     const key = offlineSessionKey(input.identity);
-    const nonce = toBase64(randomBytes(16));
-    const salt = randomBytes(16);
-    const iv = randomBytes(12);
-    const cryptoKey = await deriveKey(input.pin, salt, PBKDF2_ITERATIONS);
-
-    const core = encoder.encode(JSON.stringify({ v: RECORD_VERSION, ...input.identity, nonce }));
-    const ciphertext = new Uint8Array(
-        await subtle().encrypt({ name: "AES-GCM", iv, additionalData: additionalData(key, nonce) }, cryptoKey, core)
-    );
+    const existing = await store.get(key);
+    const reusable = existing && isWellFormed(existing, input.identity) ? existing : undefined;
+    const serverIso = new Date(clock.serverTime).toISOString();
 
     const record: OfflineSessionRecord = {
         key,
         version: RECORD_VERSION,
         ...input.identity,
-        salt: toBase64(salt),
-        iterations: PBKDF2_ITERATIONS,
-        iv: toBase64(iv),
-        ciphertext: toBase64(ciphertext),
-        nonce,
-        permissions: [...new Set(input.permissions.filter((p) => typeof p === "string"))],
-        lastOnlineCheckAt: new Date(input.now).toISOString(),
-        expiresAt: new Date(input.now + OFFLINE_SESSION_TTL_MS).toISOString(),
-        failedAttempts: 0,
-        clockHighWater: input.now,
-        createdAt: new Date(input.now).toISOString(),
-        displayName: input.displayName,
+        permissions: cleanPermissions(input.permissions),
+        lastOnlineCheckAt: serverIso,
+        expiresAt: new Date(clock.serverTime + OFFLINE_SESSION_TTL_MS).toISOString(),
+        // The device clock was just checked against the server, so the mark
+        // restarts here (this also lets a corrected clock recover).
+        clockHighWater: Math.max(input.now, clock.serverTime),
+        createdAt: reusable?.createdAt ?? serverIso,
+        displayName: input.displayName ?? reusable?.displayName,
+        serverSkewMs: clock.skewMs,
     };
 
     await store.put(record);
     return record;
 }
 
-/** Current state of an identity's offline session (no PIN needed). */
+/** Current state of an identity's offline session. */
 export async function getOfflineSessionState(
     store: OfflineSessionStore,
     identity: OfflineIdentity,
@@ -294,6 +241,10 @@ export async function getOfflineSessionState(
     if (!isIdentity(identity)) return { status: "none" };
     const record = await store.get(offlineSessionKey(identity));
     if (!record) return { status: "none" };
+
+    // Left by the earlier PIN-based version: not usable, replaced by the
+    // next successful online verification.
+    if ((record as Partial<OfflineSessionRecord>).version === 1) return { status: "none" };
 
     if (!isWellFormed(record, identity)) {
         // Tampered or corrupted: remove it (queued work is stored elsewhere
@@ -311,89 +262,29 @@ export async function getOfflineSessionState(
         expiresAt: record.expiresAt,
         lastOnlineCheckAt: record.lastOnlineCheckAt,
         permissions: record.permissions,
-        failedAttempts: record.failedAttempts,
         displayName: record.displayName,
     };
 }
 
-/** Try a PIN. Five wrong PINs delete the record (never queued work). */
-export async function unlockOfflineSession(
-    store: OfflineSessionStore,
-    identity: OfflineIdentity,
-    pin: string,
-    now: number
-): Promise<UnlockResult> {
-    const state = await getOfflineSessionState(store, identity, now);
-    if (state.status !== "available") return { ok: false, reason: state.status };
-
-    const key = offlineSessionKey(identity);
-    const record = (await store.get(key))!;
-
-    let decrypted: { v?: unknown; tenantId?: unknown; userId?: unknown; deviceId?: unknown; nonce?: unknown } | null = null;
-    if (typeof pin === "string" && /^\d+$/.test(pin)) {
-        try {
-            const cryptoKey = await deriveKey(pin, fromBase64(record.salt), record.iterations);
-            const plain = await subtle().decrypt(
-                { name: "AES-GCM", iv: fromBase64(record.iv), additionalData: additionalData(key, record.nonce) },
-                cryptoKey,
-                fromBase64(record.ciphertext)
-            );
-            decrypted = JSON.parse(new TextDecoder().decode(plain));
-        } catch {
-            decrypted = null; // wrong PIN, or the encrypted core was altered
-        }
-    }
-
-    const matches =
-        decrypted !== null &&
-        decrypted.v === RECORD_VERSION &&
-        decrypted.tenantId === identity.tenantId &&
-        decrypted.userId === identity.userId &&
-        decrypted.deviceId === identity.deviceId &&
-        decrypted.nonce === record.nonce;
-
-    if (!matches) {
-        const failedAttempts = record.failedAttempts + 1;
-        if (failedAttempts >= MAX_PIN_ATTEMPTS) {
-            await store.delete(key);
-            return { ok: false, reason: "locked-out" };
-        }
-        await store.put({ ...record, failedAttempts, clockHighWater: Math.max(record.clockHighWater, now) });
-        return { ok: false, reason: "wrong-pin", remainingAttempts: MAX_PIN_ATTEMPTS - failedAttempts };
-    }
-
-    await store.put({ ...record, failedAttempts: 0, clockHighWater: Math.max(record.clockHighWater, now) });
-    return { ok: true, marker: { key, nonce: record.nonce, unlockedAt: now }, expiresAt: record.expiresAt };
-}
-
 /**
- * Whether an unlock marker still allows offline work for this identity:
- * same account and device, same PIN setup (nonce), record present and
+ * Whether offline work is allowed for this identity: record present and
  * valid, not expired, clock not moved back, and OFFLINE_WORK_PERMISSION
- * reported by the server at the last online check.
+ * reported by the server at the last online check. Read-only.
  */
 export async function checkOfflineWorkAllowed(
     store: OfflineSessionStore,
-    marker: UnlockMarker | null,
     identity: OfflineIdentity,
     now: number
 ): Promise<{ ok: true; expiresAt: string } | { ok: false; reason: string }> {
     const state = await getOfflineSessionState(store, identity, now);
     if (state.status === "none" || state.status === "invalid") {
-        return { ok: false, reason: "Offline access is not set up for this account on this device" };
+        return { ok: false, reason: "Offline access is not available for this account on this device; sign in online first" };
     }
     if (state.status === "expired") {
         return { ok: false, reason: "The offline session has expired; sign in online to continue" };
     }
     if (state.status === "clock-rollback") {
         return { ok: false, reason: "The device clock appears to have moved backwards; sign in online to continue" };
-    }
-    if (!marker || marker.key !== offlineSessionKey(identity) || marker.unlockedAt > now + CLOCK_SKEW_MS) {
-        return { ok: false, reason: "Unlock the offline session with your PIN first" };
-    }
-    const record = await store.get(offlineSessionKey(identity));
-    if (!record || record.nonce !== marker.nonce) {
-        return { ok: false, reason: "Unlock the offline session with your PIN first" };
     }
     if (!state.permissions.includes(OFFLINE_WORK_PERMISSION)) {
         return { ok: false, reason: "This account is not allowed to record sales offline" };
@@ -402,28 +293,55 @@ export async function checkOfflineWorkAllowed(
 }
 
 /**
- * After a SUCCESSFUL server session check for this identity: renew the
- * expiry (24 h from now) and refresh the permissions. No PIN is needed and
- * nothing is created when there is no record.
+ * Whether offline product creation is allowed for this identity:
+ * record present and valid, not expired, clock not moved back, and products.create
+ * reported by the server at the last online check.
+ * Also checks whether the user has cost permission (purchases.create, products.create, etc.).
  */
-export async function renewOfflineSession(
+export async function checkOfflineProductCreationAllowed(
     store: OfflineSessionStore,
     identity: OfflineIdentity,
-    permissions: string[],
+    now: number
+): Promise<{ ok: true; expiresAt: string; canCost: boolean } | { ok: false; reason: string }> {
+    const state = await getOfflineSessionState(store, identity, now);
+    if (state.status === "none" || state.status === "invalid") {
+        return { ok: false, reason: "Offline access is not available for this account on this device; sign in online first" };
+    }
+    if (state.status === "expired") {
+        return { ok: false, reason: "The offline session has expired; sign in online to continue" };
+    }
+    if (state.status === "clock-rollback") {
+        return { ok: false, reason: "The device clock appears to have moved backwards; sign in online to continue" };
+    }
+    if (!state.permissions.includes(OFFLINE_PRODUCT_CREATE_PERMISSION)) {
+        return { ok: false, reason: "You do not have permission to create products" };
+    }
+    const canCost = state.permissions.some((p) =>
+        ["products.create", "products.update", "purchases.create", "stock.adjust"].includes(p)
+    );
+    return { ok: true, expiresAt: state.expiresAt, canCost };
+}
+
+/**
+ * Raise the clock high-water mark to `now` while the session is usable.
+ * Called whenever offline work is checked or recorded. NEVER changes the
+ * expiry or the last online check. Returns false (and writes nothing) when
+ * there is no usable session, including a suspected clock rollback.
+ */
+export async function recordOfflineActivity(
+    store: OfflineSessionStore,
+    identity: OfflineIdentity,
     now: number
 ): Promise<boolean> {
     if (!isIdentity(identity)) return false;
-    const record = await store.get(offlineSessionKey(identity));
-    if (!record || !isWellFormed(record, identity)) return false;
+    const state = await getOfflineSessionState(store, identity, now);
+    if (state.status !== "available") return false;
 
-    await store.put({
-        ...record,
-        permissions: [...new Set(permissions.filter((p) => typeof p === "string"))],
-        lastOnlineCheckAt: new Date(now).toISOString(),
-        expiresAt: new Date(now + OFFLINE_SESSION_TTL_MS).toISOString(),
-        failedAttempts: 0,
-        clockHighWater: Math.max(record.clockHighWater, now),
-    });
+    const record = await store.get(offlineSessionKey(identity));
+    if (!record) return false;
+    if (now > record.clockHighWater) {
+        await store.put({ ...record, clockHighWater: now });
+    }
     return true;
 }
 

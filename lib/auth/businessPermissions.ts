@@ -11,6 +11,7 @@ import { getGrantedPermissions } from "./hasPermission";
  * user's role at processing time).
  */
 export const BUSINESS_PERMISSIONS = {
+    productsCreate: "products.create",
     salesCreate: "sales.create",
     // Selling at a price other than the product's selling price, or with a discount.
     salesPriceOverride: "sales.priceOverride",
@@ -18,6 +19,7 @@ export const BUSINESS_PERMISSIONS = {
     salesBackdate: "sales.backdate",
     salesReturnsCreate: "salesReturns.create",
     purchasesCreate: "purchases.create",
+    purchasesRead: "purchases.read",
     purchaseReturnsCreate: "purchaseReturns.create",
     paymentsCreate: "payments.create",
     stockAdjust: "stock.adjust",
@@ -31,12 +33,15 @@ export type BusinessPermission = (typeof BUSINESS_PERMISSIONS)[keyof typeof BUSI
 
 /** Permission required to process each kind of queued offline operation. */
 export const SYNC_ENTITY_PERMISSIONS: Readonly<Record<string, BusinessPermission>> = Object.freeze({
+    Product: BUSINESS_PERMISSIONS.productsCreate,
     Sale: BUSINESS_PERMISSIONS.salesCreate,
     SalesReturn: BUSINESS_PERMISSIONS.salesReturnsCreate,
     Purchase: BUSINESS_PERMISSIONS.purchasesCreate,
     PurchaseReturn: BUSINESS_PERMISSIONS.purchaseReturnsCreate,
     Payment: BUSINESS_PERMISSIONS.paymentsCreate,
     StockAdjustment: BUSINESS_PERMISSIONS.stockAdjust,
+    Customer: BUSINESS_PERMISSIONS.salesCreate,
+    Supplier: BUSINESS_PERMISSIONS.purchasesCreate,
 });
 
 /**
@@ -102,3 +107,27 @@ export async function requireBusinessPermission(
         { status: 403 }
     );
 }
+
+/**
+ * For route handlers requiring any one of several business permissions.
+ * Returns null when the user holds at least one of the permissions,
+ * otherwise returns a standard HTTP 403 response.
+ */
+export async function requireAnyBusinessPermission(
+    context: AuthenticatedContext,
+    permissions: BusinessPermission[]
+): Promise<NextResponse | null> {
+    const granted = await getGrantedBusinessPermissions(context, permissions);
+
+    for (const perm of permissions) {
+        if (granted.has(perm)) {
+            return null;
+        }
+    }
+
+    return NextResponse.json(
+        { success: false, message: "Permission denied" },
+        { status: 403 }
+    );
+}
+

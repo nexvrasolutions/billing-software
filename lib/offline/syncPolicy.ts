@@ -19,6 +19,9 @@ export interface QueueItemState {
     nextAttemptAt?: string;
     syncingSince?: string;
     owner?: SessionIdentity;
+    operationId?: string;
+    entityType?: string;
+    dependsOn?: string[];
 }
 
 /** Client-side attempt limit before an item needs attention. */
@@ -39,11 +42,35 @@ export function isOwnedBy(item: { owner?: SessionIdentity }, identity: SessionId
 
 /** Items of THIS account that are due for a sync attempt, in queue order. */
 export function selectSyncable<T extends QueueItemState>(items: T[], identity: SessionIdentity, now: Date): T[] {
+    const candidateMap = new Map<string, T>();
+    for (const item of items) {
+        if (item.operationId) candidateMap.set(item.operationId, item);
+    }
+
     return items
         .filter((item) => isOwnedBy(item, identity))
         .filter((item) => item.status === "PENDING" || item.status === "FAILED")
         .filter((item) => !item.nextAttemptAt || new Date(item.nextAttemptAt).getTime() <= now.getTime())
-        .sort((a, b) => a.localSeq - b.localSeq);
+        .filter((item) => {
+            // If item has dependencies, check if all are SYNCED
+            if (item.dependsOn && item.dependsOn.length > 0) {
+                for (const depOpId of item.dependsOn) {
+                    const dep = candidateMap.get(depOpId);
+                    // If dependency is present and not SYNCED, skip this item for now
+                    if (dep && dep.status !== "SYNCED") {
+                        return false;
+                    }
+                }
+            }
+            return true;
+        })
+        .sort((a, b) => {
+            // Process Product, Customer, and Supplier creations before dependent operations (e.g. Sales, Purchases)
+            const isPrerequisite = (type?: string) => type === "Product" || type === "Customer" || type === "Supplier";
+            if (isPrerequisite(a.entityType) && !isPrerequisite(b.entityType)) return -1;
+            if (!isPrerequisite(a.entityType) && isPrerequisite(b.entityType)) return 1;
+            return a.localSeq - b.localSeq;
+        });
 }
 
 /**
@@ -69,7 +96,18 @@ export type SyncOutcome =
     | { kind: "retryable"; message: string; retryAfterSeconds?: number }
     | { kind: "permanent"; message: string }
     /** Stop the whole run without touching the item (wrong/no session). */
-    | { kind: "stop"; message: string };
+    | { kind: "stop"; message: string }
+    /**
+     * No answer from the server (network failure or timeout). Says nothing
+     * about the operation: the item is left as it was, no attempt is
+     * counted, and the run stops.
+     */
+    | { kind: "unreachable"; message: string };
+
+/** Outcome of a request that got no answer from the server. */
+export function unreachableOutcome(): Extract<SyncOutcome, { kind: "unreachable" }> {
+    return { kind: "unreachable", message: "The server could not be reached while syncing" };
+}
 
 /** Interpret a server response from upload or process. */
 export function interpretResponse(
@@ -82,8 +120,10 @@ export function interpretResponse(
         return { kind: "success" };
     }
 
-    // Not signed in, or the item belongs to another account: leave it alone.
-    if (status === 401 || body?.code === "OWNER_MISMATCH") {
+    // Not signed in, the item belongs to another account, or the Origin
+    // check refused the request (proxy.ts): leave the item alone. None of
+    // these says anything about the sale, so no attempt is counted.
+    if (status === 401 || body?.code === "OWNER_MISMATCH" || body?.code === "ORIGIN_REFUSED") {
         return { kind: "stop", message };
     }
 
@@ -101,7 +141,7 @@ export function interpretResponse(
 
 /** Next local state after a failed attempt (attempts includes this one). */
 export function stateAfterFailure(
-    outcome: Exclude<SyncOutcome, { kind: "success" } | { kind: "stop" }>,
+    outcome: Exclude<SyncOutcome, { kind: "success" } | { kind: "stop" } | { kind: "unreachable" }>,
     attempts: number,
     now: Date,
     random: () => number = Math.random
@@ -112,6 +152,39 @@ export function stateAfterFailure(
 
     const delay = Math.max(backoffDelayMs(attempts, random), (outcome.retryAfterSeconds ?? 0) * 1000);
     return { status: "FAILED", nextAttemptAt: new Date(now.getTime() + delay).toISOString() };
+}
+
+/** What happens to a queue item after the outcome of one sync attempt. */
+export type ItemDecision =
+    | { action: "synced" }
+    /** Put the item back exactly as it was (no attempt counted) and end the run. */
+    | { action: "restore"; stopReason: "session" | "unreachable" }
+    | {
+        action: "failed";
+        attempts: number;
+        status: "FAILED" | "NEEDS_ATTENTION";
+        nextAttemptAt?: string;
+        message: string;
+    };
+
+/**
+ * Decide the item's next local state. Only real server answers (retryable
+ * or permanent) count as an attempt; a wrong/missing session and an
+ * unreachable server leave the item untouched.
+ */
+export function decideAfterOutcome(
+    outcome: SyncOutcome,
+    previousAttempts: number,
+    now: Date,
+    random: () => number = Math.random
+): ItemDecision {
+    if (outcome.kind === "success") return { action: "synced" };
+    if (outcome.kind === "stop") return { action: "restore", stopReason: "session" };
+    if (outcome.kind === "unreachable") return { action: "restore", stopReason: "unreachable" };
+
+    const attempts = previousAttempts + 1;
+    const next = stateAfterFailure(outcome, attempts, now, random);
+    return { action: "failed", attempts, ...next, message: outcome.message };
 }
 
 /** Cryptographically secure operation ID. */

@@ -85,6 +85,14 @@ export async function POST(request: NextRequest) {
             alreadySynced: result.alreadySynced,
             operationId: result.operation.operationId,
             status: result.operation.status,
+            ...(result.result ? { result: result.result } : {}),
+            ...(result.result && "invoiceNo" in result.result ? {
+                sale: {
+                    id: result.result._id,
+                    invoiceNo: result.result.invoiceNo,
+                    provisionalInvoiceNo: result.result.provisionalInvoiceNo,
+                }
+            } : {}),
         });
     } catch (error: unknown) {
         if (error instanceof SyncProcessError) {

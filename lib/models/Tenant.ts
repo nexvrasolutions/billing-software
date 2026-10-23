@@ -6,6 +6,8 @@ export interface ITenant extends Document {
 
     status: "active" | "inactive";
 
+    pricingMode: "tax_inclusive" | "tax_exclusive";
+
     // The verified business owner. Only the owner may grant
     // administrator-level roles. Set only by a server-side script
     // (scripts/designate-tenant-owner.ts), never by an API request.
@@ -32,6 +34,12 @@ const TenantSchema = new Schema<ITenant>(
             type: String,
             enum: ["active", "inactive"],
             default: "active",
+        },
+
+        pricingMode: {
+            type: String,
+            enum: ["tax_inclusive", "tax_exclusive"],
+            default: "tax_inclusive",
         },
 
         ownerUserId: {

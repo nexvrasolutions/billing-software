@@ -1,9 +1,12 @@
 import mongoose from "mongoose";
 
 import { Sale } from "@/lib/models/Sale";
+import { Payment } from "@/lib/models/Payment";
 import { Product } from "@/lib/models/Product";
+import { InvoiceNumberService, isProvisionalInvoiceNo } from "@/lib/services/InvoiceNumberService";
 import { Customer } from "@/lib/models/Customer";
 import { Unit } from "@/lib/models/Unit";
+import { Tenant } from "@/lib/models/Tenant";
 import { StockService } from "@/lib/services/StockService";
 import { LedgerService } from "@/lib/services/LedgerService";
 import { AuditLogService } from "@/lib/services/AuditLogService";
@@ -11,6 +14,63 @@ import {
     BusinessPermissionError,
     SALE_DATE_RULES,
 } from "@/lib/auth/businessPermissions";
+import { SyncProcessError } from "@/lib/services/SyncErrors";
+import {
+    calculateSale,
+    BillMathError,
+    type CalculateSaleLineInput,
+    type CalculateSaleResult,
+} from "@/lib/bill-maths";
+
+/**
+ * Resolves the effective tax rate for a sale item.
+ *
+ * Distinguishes an explicit 0% tax rate from a missing/unconfigured tax rate.
+ * - If both item.taxRate and product.taxRate are defined, verifies they match (rejects tampered rates).
+ * - If item.taxRate is omitted, but product.taxRate is configured in the catalog (including 0), it is applied.
+ * - If product.taxRate is omitted, but item.taxRate is explicitly specified (including 0), it is applied.
+ * - If neither has a configured tax rate, throws a recoverable NEEDS_ATTENTION SyncProcessError.
+ */
+export function resolveItemTaxRate(
+    itemTaxRate: unknown,
+    productTaxRate: unknown,
+    productInfo: { name: string; SKU?: string }
+): number {
+    const isNum = (v: unknown): v is number =>
+        typeof v === "number" && Number.isFinite(v) && v >= 0 && v <= 100;
+
+    const hasItemRate = isNum(itemTaxRate);
+    const hasProductRate = isNum(productTaxRate);
+
+    if (hasItemRate && hasProductRate) {
+        if (itemTaxRate !== productTaxRate) {
+            const skuInfo = productInfo.SKU ? ` (${productInfo.SKU})` : "";
+            throw new SyncProcessError(
+                400,
+                "INVALID_REQUEST",
+                `Tax rate mismatch for product '${productInfo.name}'${skuInfo}: submitted rate ${itemTaxRate}% does not match configured catalog rate ${productTaxRate}%`,
+                false
+            );
+        }
+        return productTaxRate;
+    }
+
+    if (hasProductRate) {
+        return productTaxRate;
+    }
+
+    if (hasItemRate) {
+        return itemTaxRate;
+    }
+
+    const skuInfo = productInfo.SKU ? ` (${productInfo.SKU})` : "";
+    throw new SyncProcessError(
+        422,
+        "NEEDS_ATTENTION",
+        `Product '${productInfo.name}'${skuInfo} lacks tax configuration; tax treatment must be explicitly configured before this sale can be processed`,
+        false
+    );
+}
 
 export interface SalesUserContext {
     userId: mongoose.Types.ObjectId;
@@ -91,11 +151,20 @@ export interface SaleItemInput {
     quantity: number;
     unitPrice?: number;
     discountRate?: number;
+    discountAmount?: number;
     taxRate?: number;
+}
+
+export interface PaymentComponentInput {
+    method: "cash" | "bank" | "upi" | "card";
+    amount: number;
+    referenceNo?: string;
+    notes?: string;
 }
 
 export interface CreateSaleInput {
     invoiceNo: string;
+    provisionalInvoiceNo?: string;
 
     customerId?: string;
 
@@ -117,6 +186,10 @@ export interface CreateSaleInput {
     | "card"
     | "credit";
 
+    paymentComponents?: PaymentComponentInput[];
+
+    roundOff?: boolean;
+
     notes?: string;
 }
 
@@ -129,17 +202,31 @@ export class SalesService {
         user: SalesUserContext,
         input: CreateSaleInput,
         operationId?: string,
-        policy: SalePolicy = strictSalePolicy()
+        policy: SalePolicy = strictSalePolicy(),
+        deps?: {
+            pricingMode?: "tax_inclusive" | "tax_exclusive";
+            getTenantPricingMode?: (tenantId: mongoose.Types.ObjectId) => Promise<"tax_inclusive" | "tax_exclusive">;
+            generateInvoiceNo?: (tenantId: mongoose.Types.ObjectId, session: mongoose.ClientSession) => Promise<string>;
+        }
     ) {
         const session =
             await mongoose.startSession();
 
         // Invoice numbers are stored upper-case and trimmed (schema), and
         // are unique per tenant (database index tenantId + invoiceNo).
-        const invoiceNo =
+        let invoiceNo =
             typeof input.invoiceNo === "string"
                 ? input.invoiceNo.trim().toUpperCase()
                 : "";
+
+        let provisionalInvoiceNo =
+            typeof input.provisionalInvoiceNo === "string" && input.provisionalInvoiceNo.trim()
+                ? input.provisionalInvoiceNo.trim().toUpperCase()
+                : undefined;
+
+        if (!provisionalInvoiceNo && isProvisionalInvoiceNo(invoiceNo)) {
+            provisionalInvoiceNo = invoiceNo;
+        }
 
         /*
          * operationId is supplied by SyncService when the sale
@@ -172,46 +259,14 @@ export class SalesService {
                     }
 
                     // ----------------------------------------------------
-                    // 2. Validate invoice number
-                    // ----------------------------------------------------
-
-                    if (!invoiceNo) {
-                        throw new Error(
-                            "Invoice number is required"
-                        );
-                    }
-
-                    // ----------------------------------------------------
-                    // 3. Validate warehouse
-                    // ----------------------------------------------------
-
-                    if (!input.warehouse?.name?.trim()) {
-                        throw new Error(
-                            "Warehouse name is required"
-                        );
-                    }
-
-                    // ----------------------------------------------------
-                    // 4. Validate sale items
-                    // ----------------------------------------------------
-
-                    if (
-                        !Array.isArray(input.items) ||
-                        input.items.length === 0
-                    ) {
-                        throw new Error(
-                            "At least one sale item is required"
-                        );
-                    }
-
-                    // ----------------------------------------------------
-                    // 5. IDEMPOTENCY CHECK
+                    // 2. IDEMPOTENCY CHECK (FIRST before any number allocation)
                     // ----------------------------------------------------
                     //
-                    // If this exact offline operation has already
-                    // created a sale, return that existing sale.
+                    // If this exact offline operation has already created
+                    // a sale, return that existing sale immediately.
                     //
-                    // This is what makes retrying the same operation safe.
+                    // This is what makes retrying the same operation safe,
+                    // and ensures the invoice counter is NEVER burned or incremented.
                     // ----------------------------------------------------
 
                     if (normalizedOperationId) {
@@ -228,6 +283,59 @@ export class SalesService {
 
                             return;
                         }
+                    }
+
+                    // ----------------------------------------------------
+                    // 3. Resolve invoice number & provisional offline reference
+                    // ----------------------------------------------------
+                    // If input has no invoice number or it's a provisional reference,
+                    // allocate an authoritative permanent invoice number on the server.
+
+                    if (!invoiceNo || isProvisionalInvoiceNo(invoiceNo)) {
+                        if (deps?.generateInvoiceNo) {
+                            invoiceNo = (await deps.generateInvoiceNo(user.tenantId, session)).trim().toUpperCase();
+                        } else {
+                            try {
+                                invoiceNo = await InvoiceNumberService.generateNextInvoiceNo(
+                                    user.tenantId,
+                                    session,
+                                    { date: input.saleDate }
+                                );
+                            } catch {
+                                if (!invoiceNo) {
+                                    invoiceNo = provisionalInvoiceNo || "";
+                                }
+                            }
+                        }
+                    }
+
+                    if (!invoiceNo) {
+                        throw new Error(
+                            "Invoice number is required"
+                        );
+                    }
+
+                    // ----------------------------------------------------
+                    // 4. Validate warehouse
+                    // ----------------------------------------------------
+
+                    if (!input.warehouse?.name?.trim()) {
+                        throw new Error(
+                            "Warehouse name is required"
+                        );
+                    }
+
+                    // ----------------------------------------------------
+                    // 5. Validate sale items
+                    // ----------------------------------------------------
+
+                    if (
+                        !Array.isArray(input.items) ||
+                        input.items.length === 0
+                    ) {
+                        throw new Error(
+                            "At least one sale item is required"
+                        );
                     }
 
                     // ----------------------------------------------------
@@ -293,14 +401,34 @@ export class SalesService {
                     }
 
                     // ----------------------------------------------------
-                    // 8. Prepare sale items
+                    // 7b. Resolve tenant pricing mode
                     // ----------------------------------------------------
 
-                    const saleItems = [];
+                    let pricingMode: "tax_inclusive" | "tax_exclusive" = "tax_inclusive";
+                    if (deps?.pricingMode) {
+                        pricingMode = deps.pricingMode;
+                    } else if (deps?.getTenantPricingMode) {
+                        pricingMode = await deps.getTenantPricingMode(user.tenantId);
+                    } else {
+                        const tenantDoc = await Tenant.findById(user.tenantId).session(session).lean();
+                        if (tenantDoc?.pricingMode === "tax_exclusive") {
+                            pricingMode = "tax_exclusive";
+                        } else {
+                            pricingMode = "tax_inclusive";
+                        }
+                    }
 
-                    let subtotal = 0;
-                    let discountTotal = 0;
-                    let taxTotal = 0;
+                    // ----------------------------------------------------
+                    // 8. Prepare sale items & validate against catalogue
+                    // ----------------------------------------------------
+
+                    const lineInputsForCalc: CalculateSaleLineInput[] = [];
+                    const validatedProducts: {
+                        product: any;
+                        unit: any;
+                        unitPrice: number;
+                        discountRate: number;
+                    }[] = [];
                     let priceOverridden = false;
 
                     // ----------------------------------------------------
@@ -415,13 +543,25 @@ export class SalesService {
                             );
                         }
 
+                        if (
+                            item.discountAmount !== undefined &&
+                            (typeof item.discountAmount !== "number" ||
+                                !Number.isFinite(item.discountAmount) ||
+                                item.discountAmount < 0)
+                        ) {
+                            throw new Error(
+                                `Invalid discount amount for ${product.name}`
+                            );
+                        }
+
                         // ------------------------------------------------
                         // Price override / discount permission
                         // ------------------------------------------------
 
                         const lineOverridesPrice =
                             Math.abs(unitPrice - product.sellingPrice) > 1e-9 ||
-                            discountRate > 0;
+                            discountRate > 0 ||
+                            (item.discountAmount !== undefined && item.discountAmount > 0);
 
                         if (
                             lineOverridesPrice &&
@@ -435,137 +575,91 @@ export class SalesService {
                         priceOverridden ||= lineOverridesPrice;
 
                         // ------------------------------------------------
-                        // Calculate gross amount
+                        // Tax rate resolution
                         // ------------------------------------------------
 
-                        const grossAmount =
-                            item.quantity *
-                            unitPrice;
+                        const taxRate = resolveItemTaxRate(
+                            item.taxRate,
+                            product.taxRate,
+                            { name: product.name, SKU: product.SKU }
+                        );
 
-                        // ------------------------------------------------
-                        // Calculate discount
-                        // ------------------------------------------------
-
-                        const discountAmount =
-                            (grossAmount *
-                                discountRate) /
-                            100;
-
-                        // ------------------------------------------------
-                        // Calculate taxable amount
-                        // ------------------------------------------------
-
-                        const taxableAmount =
-                            grossAmount -
-                            discountAmount;
-
-                        // ------------------------------------------------
-                        // Tax
-                        // ------------------------------------------------
-
-                        const taxRate =
-                            item.taxRate ?? 0;
-
-                        if (
-                            typeof taxRate !== "number" ||
-                            !Number.isFinite(
-                                taxRate
-                            ) ||
-                            taxRate < 0
-                        ) {
-                            throw new Error(
-                                `Invalid tax rate for ${product.name}`
-                            );
-                        }
-
-                        const taxAmount =
-                            (taxableAmount *
-                                taxRate) /
-                            100;
-
-                        // ------------------------------------------------
-                        // Line total
-                        // ------------------------------------------------
-
-                        const lineTotal =
-                            taxableAmount +
-                            taxAmount;
-
-                        // ------------------------------------------------
-                        // Add totals
-                        // ------------------------------------------------
-
-                        subtotal +=
-                            grossAmount;
-
-                        discountTotal +=
-                            discountAmount;
-
-                        taxTotal +=
-                            taxAmount;
-
-                        // ------------------------------------------------
-                        // Create sale item
-                        // ------------------------------------------------
-
-                        saleItems.push({
-                            productId:
-                                product._id,
-
-                            productSnapshot: {
-                                name:
-                                    product.name,
-
-                                SKU:
-                                    product.SKU,
-
-                                unit:
-                                    unit.shortName,
-                            },
-
-                            quantity:
-                                item.quantity,
-
+                        validatedProducts.push({
+                            product,
+                            unit,
                             unitPrice,
-
                             discountRate,
+                        });
 
-                            discountAmount,
-
-                            tax: {
-                                rate:
-                                    taxRate,
-
-                                amount:
-                                    taxAmount,
-                            },
-
-                            total:
-                                lineTotal,
+                        lineInputsForCalc.push({
+                            productId: product._id.toString(),
+                            name: product.name,
+                            SKU: product.SKU,
+                            quantity: item.quantity,
+                            unitPrice,
+                            discountRate,
+                            discountAmount: item.discountAmount,
+                            taxRate,
                         });
                     }
 
                     // ----------------------------------------------------
-                    // 10. Additional charges
+                    // 10. Unified calculation (pure, exact paise arithmetic)
                     // ----------------------------------------------------
 
+                    let saleCalc: CalculateSaleResult;
+                    try {
+                        saleCalc = calculateSale({
+                            lines: lineInputsForCalc,
+                            pricingMode,
+                            roundOff: input.roundOff === true,
+                        });
+                    } catch (mathErr) {
+                        if (mathErr instanceof BillMathError) {
+                            throw new SyncProcessError(
+                                422,
+                                "INVALID_REQUEST",
+                                mathErr.message,
+                                false
+                            );
+                        }
+                        throw mathErr;
+                    }
+
+                    // ----------------------------------------------------
+                    // 11. Build saleItems from authoritative calculation
+                    // ----------------------------------------------------
+
+                    const saleItems = saleCalc.lines.map((calcLine, index) => {
+                        const vp = validatedProducts[index]!;
+                        const itemInput = input.items[index]!;
+
+                        return {
+                            productId: vp.product._id,
+                            productSnapshot: {
+                                name: vp.product.name,
+                                SKU: vp.product.SKU,
+                                unit: vp.unit.shortName,
+                            },
+                            quantity: itemInput.quantity,
+                            unitPrice: vp.unitPrice,
+                            discountRate: vp.discountRate,
+                            discountAmount: calcLine.discountAmount,
+                            tax: {
+                                rate: calcLine.taxRate,
+                                amount: calcLine.taxAmount,
+                            },
+                            total: calcLine.lineTotal,
+                        };
+                    });
+
+                    const subtotal = saleCalc.subtotal;
+                    const discountTotal = saleCalc.discountTotal;
+                    const taxTotal = saleCalc.taxTotal;
                     const shippingCost = 0;
-
                     const otherCharges = 0;
-
-                    const roundOff = 0;
-
-                    // ----------------------------------------------------
-                    // 11. Calculate grand total
-                    // ----------------------------------------------------
-
-                    const grandTotal =
-                        subtotal -
-                        discountTotal +
-                        taxTotal +
-                        shippingCost +
-                        otherCharges +
-                        roundOff;
+                    const roundOff = saleCalc.roundOff;
+                    const grandTotal = saleCalc.grandTotal;
 
                     // ----------------------------------------------------
                     // 12. Validate paid amount
@@ -594,6 +688,72 @@ export class SalesService {
                         throw new Error(
                             "Paid amount cannot exceed grandTotal"
                         );
+                    }
+
+                    // ----------------------------------------------------
+                    // 12b. Resolve and validate payment components
+                    // ----------------------------------------------------
+
+                    let resolvedComponents: PaymentComponentInput[] = [];
+
+                    if (Array.isArray(input.paymentComponents) && input.paymentComponents.length > 0) {
+                        resolvedComponents = input.paymentComponents;
+                    } else if (paidAmount > 0 && input.paymentMethod && input.paymentMethod !== "credit") {
+                        // Legacy single-method fallback
+                        resolvedComponents = [
+                            {
+                                method: input.paymentMethod as "cash" | "bank" | "upi" | "card",
+                                amount: paidAmount,
+                            },
+                        ];
+                    }
+
+                    if (paidAmount === 0) {
+                        if (resolvedComponents.length > 0) {
+                            const positiveSum = resolvedComponents.reduce(
+                                (acc, c) => acc + (typeof c.amount === "number" ? c.amount : 0),
+                                0
+                            );
+                            if (positiveSum > 0) {
+                                throw new Error("Payment components cannot be provided when paidAmount is 0");
+                            }
+                        }
+                    } else {
+                        if (resolvedComponents.length === 0) {
+                            throw new Error("Payment method or payment components are required when paidAmount > 0");
+                        }
+
+                        const allowedMethods = new Set(["cash", "bank", "upi", "card"]);
+                        let totalPaise = 0n;
+
+                        for (let i = 0; i < resolvedComponents.length; i++) {
+                            const comp = resolvedComponents[i];
+                            if (!comp || !allowedMethods.has(comp.method)) {
+                                throw new Error(`Invalid payment component method at index ${i}: ${comp?.method}`);
+                            }
+                            if (
+                                typeof comp.amount !== "number" ||
+                                !Number.isFinite(comp.amount) ||
+                                comp.amount <= 0
+                            ) {
+                                throw new Error(`Payment component amount must be positive at index ${i}`);
+                            }
+
+                            // Check precision (maximum 2 decimal places)
+                            const scaled = Math.round(comp.amount * 100);
+                            if (Math.abs(comp.amount * 100 - scaled) > 1e-4) {
+                                throw new Error(`Payment component amount at index ${i} has more than 2 decimal places`);
+                            }
+
+                            totalPaise += BigInt(scaled);
+                        }
+
+                        const paidAmountPaise = BigInt(Math.round(paidAmount * 100));
+                        if (totalPaise !== paidAmountPaise) {
+                            throw new Error(
+                                `Sum of payment components (${Number(totalPaise) / 100}) does not match paidAmount (${paidAmount})`
+                            );
+                        }
                     }
 
                     // ----------------------------------------------------
@@ -647,6 +807,8 @@ export class SalesService {
 
                         invoiceNo,
 
+                        provisionalInvoiceNo,
+
                         customerId:
                             customer?._id,
 
@@ -698,7 +860,15 @@ export class SalesService {
                         paymentStatus,
 
                         paymentMethod:
-                            input.paymentMethod,
+                            input.paymentMethod ??
+                            (resolvedComponents.length === 1
+                                ? resolvedComponents[0]!.method
+                                : undefined),
+
+                        payments:
+                            resolvedComponents.length > 0
+                                ? resolvedComponents
+                                : undefined,
 
                         status:
                             "completed",
@@ -717,6 +887,36 @@ export class SalesService {
                     await sale.save({
                         session,
                     });
+
+                    // ----------------------------------------------------
+                    // 16b. Create atomic Payment receipt records
+                    // ----------------------------------------------------
+
+                    for (let i = 0; i < resolvedComponents.length; i++) {
+                        const comp = resolvedComponents[i]!;
+                        const paymentNo = `${sale.invoiceNo}-PAY-${i + 1}`;
+                        const compOperationId = normalizedOperationId
+                            ? `${normalizedOperationId}:pay:${i + 1}`
+                            : undefined;
+
+                        const payment = new Payment({
+                            tenantId: user.tenantId,
+                            operationId: compOperationId,
+                            paymentNo,
+                            type: "receipt",
+                            amount: comp.amount,
+                            paymentMethod: comp.method,
+                            paymentDate: sale.saleDate,
+                            customerId: sale.customerId,
+                            saleId: sale._id,
+                            referenceNo: comp.referenceNo,
+                            notes: comp.notes,
+                            status: "completed",
+                            createdBy: user.userId,
+                        });
+
+                        await payment.save({ session });
+                    }
 
                     // ----------------------------------------------------
                     // 17. Update stock
@@ -757,61 +957,120 @@ export class SalesService {
                     }
 
                     // ----------------------------------------------------
-                    // 18. Create ledger entries
+                    // 18. Create ledger entries (Double-entry balanced)
                     // ----------------------------------------------------
+
+                    const ledgerEntries: any[] = [
+                        {
+                            transactionId:
+                                sale._id.toString(),
+
+                            transactionType:
+                                "sale",
+
+                            account:
+                                "accounts_receivable",
+
+                            entryType:
+                                "debit",
+
+                            amount:
+                                sale.grandTotal,
+
+                            customerId:
+                                sale.customerId?.toString(),
+
+                            description:
+                                `Sale receivable - ${sale.invoiceNo}`,
+
+                            entryDate:
+                                sale.saleDate,
+                        },
+
+                        {
+                            transactionId:
+                                sale._id.toString(),
+
+                            transactionType:
+                                "sale",
+
+                            account:
+                                "sales_revenue",
+
+                            entryType:
+                                "credit",
+
+                            amount:
+                                sale.grandTotal,
+
+                            description:
+                                `Sales revenue - ${sale.invoiceNo}`,
+
+                            entryDate:
+                                sale.saleDate,
+                        },
+                    ];
+
+                    for (const comp of resolvedComponents) {
+                        const moneyAccount =
+                            comp.method === "cash" ? "cash" : "bank";
+
+                        ledgerEntries.push({
+                            transactionId:
+                                sale._id.toString(),
+
+                            transactionType:
+                                "sale",
+
+                            account:
+                                moneyAccount,
+
+                            entryType:
+                                "debit",
+
+                            amount:
+                                comp.amount,
+
+                            customerId:
+                                sale.customerId?.toString(),
+
+                            description:
+                                `Receipt (${comp.method.toUpperCase()}) - ${sale.invoiceNo}`,
+
+                            entryDate:
+                                sale.saleDate,
+                        });
+
+                        ledgerEntries.push({
+                            transactionId:
+                                sale._id.toString(),
+
+                            transactionType:
+                                "sale",
+
+                            account:
+                                "accounts_receivable",
+
+                            entryType:
+                                "credit",
+
+                            amount:
+                                comp.amount,
+
+                            customerId:
+                                sale.customerId?.toString(),
+
+                            description:
+                                `Payment applied - ${sale.invoiceNo}`,
+
+                            entryDate:
+                                sale.saleDate,
+                        });
+                    }
 
                     await LedgerService.createEntries(
                         user,
-                        [
-                            {
-                                transactionId:
-                                    sale._id.toString(),
-
-                                transactionType:
-                                    "sale",
-
-                                account:
-                                    "accounts_receivable",
-
-                                entryType:
-                                    "debit",
-
-                                amount:
-                                    sale.grandTotal,
-
-                                customerId:
-                                    sale.customerId?.toString(),
-
-                                description:
-                                    `Sale receivable - ${sale.invoiceNo}`,
-
-                                entryDate:
-                                    sale.saleDate,
-                            },
-
-                            {
-                                transactionId:
-                                    sale._id.toString(),
-
-                                transactionType:
-                                    "sale",
-
-                                account:
-                                    "sales_revenue",
-
-                                entryType:
-                                    "credit",
-
-                                amount:
-                                    sale.grandTotal,
-
-                                description:
-                                    `Sales revenue - ${sale.invoiceNo}`,
-
-                                entryDate:
-                                    sale.saleDate,
-                            },
-                        ],
+                        ledgerEntries,
                         session
                     );
 
@@ -834,11 +1093,13 @@ export class SalesService {
                                 `Sale ${sale.invoiceNo} created`,
                             newValues: {
                                 invoiceNo: sale.invoiceNo,
+                                provisionalInvoiceNo: sale.provisionalInvoiceNo,
                                 saleDate: sale.saleDate,
                                 grandTotal: sale.grandTotal,
                                 paidAmount: sale.paidAmount,
                                 paymentStatus: sale.paymentStatus,
                                 itemCount: saleItems.length,
+                                paymentsCount: resolvedComponents.length,
                                 operationId: sale.operationId,
                                 priceOverridden,
                                 backdated,
