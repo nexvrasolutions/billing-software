@@ -14,15 +14,10 @@ import {
     updateSupplierSchema,
     supplierLifecycleSchema,
     isValidSupplierTransition,
+    SUPPLIER_WRITE_PERMISSIONS,
+    SUPPLIER_READ_PERMISSIONS,
     type SupplierLifecycleAction,
 } from "@/lib/validations/supplier";
-
-const SUPPLIER_WRITE_PERMISSIONS = [
-    "purchases.create",
-    "products.create",
-    "products.update",
-    "users.read",
-];
 
 type RouteContext = {
     params: Promise<{ id: string }>;
@@ -38,6 +33,27 @@ export async function GET(
             return NextResponse.json(
                 { success: false, message: "Authentication required" },
                 { status: 401 }
+            );
+        }
+
+        if (!auth.roleId) {
+            return NextResponse.json(
+                { success: false, message: "Permission denied" },
+                { status: 403 }
+            );
+        }
+
+        const granted = await getGrantedPermissions({
+            userId: auth.userId,
+            tenantId: auth.tenantId,
+            roleId: auth.roleId,
+            permissions: SUPPLIER_READ_PERMISSIONS,
+        });
+
+        if (granted.size === 0) {
+            return NextResponse.json(
+                { success: false, message: "You do not have permission to view suppliers" },
+                { status: 403 }
             );
         }
 
@@ -104,21 +120,26 @@ export async function PUT(
             );
         }
 
-        // Verify role authorization when roleId is present
-        if (auth.roleId) {
-            const granted = await getGrantedPermissions({
-                userId: auth.userId,
-                tenantId: auth.tenantId,
-                roleId: auth.roleId,
-                permissions: SUPPLIER_WRITE_PERMISSIONS,
-            });
+        // Verify role authorization (fail closed if role is missing)
+        if (!auth.roleId) {
+            return NextResponse.json(
+                { success: false, message: "Permission denied" },
+                { status: 403 }
+            );
+        }
 
-            if (granted.size === 0) {
-                return NextResponse.json(
-                    { success: false, message: "You do not have permission to update suppliers" },
-                    { status: 403 }
-                );
-            }
+        const granted = await getGrantedPermissions({
+            userId: auth.userId,
+            tenantId: auth.tenantId,
+            roleId: auth.roleId,
+            permissions: SUPPLIER_WRITE_PERMISSIONS,
+        });
+
+        if (granted.size === 0) {
+            return NextResponse.json(
+                { success: false, message: "You do not have permission to update suppliers" },
+                { status: 403 }
+            );
         }
 
         const { id } = await context.params;
@@ -319,21 +340,26 @@ export async function PATCH(
             );
         }
 
-        // Verify role authorization when roleId is present
-        if (auth.roleId) {
-            const granted = await getGrantedPermissions({
-                userId: auth.userId,
-                tenantId: auth.tenantId,
-                roleId: auth.roleId,
-                permissions: SUPPLIER_WRITE_PERMISSIONS,
-            });
+        // Verify role authorization (fail closed if role is missing)
+        if (!auth.roleId) {
+            return NextResponse.json(
+                { success: false, message: "Permission denied" },
+                { status: 403 }
+            );
+        }
 
-            if (granted.size === 0) {
-                return NextResponse.json(
-                    { success: false, message: "You do not have permission to modify supplier lifecycle" },
-                    { status: 403 }
-                );
-            }
+        const granted = await getGrantedPermissions({
+            userId: auth.userId,
+            tenantId: auth.tenantId,
+            roleId: auth.roleId,
+            permissions: SUPPLIER_WRITE_PERMISSIONS,
+        });
+
+        if (granted.size === 0) {
+            return NextResponse.json(
+                { success: false, message: "You do not have permission to modify supplier lifecycle" },
+                { status: 403 }
+            );
         }
 
         const { id } = await context.params;
@@ -470,21 +496,26 @@ export async function DELETE(
             );
         }
 
-        // Verify role authorization when roleId is present
-        if (auth.roleId) {
-            const granted = await getGrantedPermissions({
-                userId: auth.userId,
-                tenantId: auth.tenantId,
-                roleId: auth.roleId,
-                permissions: SUPPLIER_WRITE_PERMISSIONS,
-            });
+        // Verify role authorization (fail closed if role is missing)
+        if (!auth.roleId) {
+            return NextResponse.json(
+                { success: false, message: "Permission denied" },
+                { status: 403 }
+            );
+        }
 
-            if (granted.size === 0) {
-                return NextResponse.json(
-                    { success: false, message: "You do not have permission to delete or archive suppliers" },
-                    { status: 403 }
-                );
-            }
+        const granted = await getGrantedPermissions({
+            userId: auth.userId,
+            tenantId: auth.tenantId,
+            roleId: auth.roleId,
+            permissions: SUPPLIER_WRITE_PERMISSIONS,
+        });
+
+        if (granted.size === 0) {
+            return NextResponse.json(
+                { success: false, message: "You do not have permission to delete or archive suppliers" },
+                { status: 403 }
+            );
         }
 
         const { id } = await context.params;

@@ -494,7 +494,11 @@ export async function resolvePendingProductId(
         return { resolved: false, dependentSalesUpdated: 0 };
     }
 
-    return await db.transaction("rw", db.cachedProducts, db.syncQueue, async () => {
+    const tables = db.cachedPurchases
+        ? [db.cachedProducts, db.syncQueue, db.cachedPurchases]
+        : [db.cachedProducts, db.syncQueue];
+
+    return await db.transaction("rw", tables, async () => {
         // 1. Update cachedProducts
         const oldKey = makeCachedProductId(cleanTenantId, cleanLocalId);
         const existingRecord = await db.cachedProducts.get(oldKey);
@@ -512,22 +516,27 @@ export async function resolvePendingProductId(
             await db.cachedProducts.put(updatedRecord);
         }
 
-        // 2. Scan syncQueue for sales (or other operations) referencing localId
+        // 2. Scan syncQueue for operations referencing localId (scoped strictly to active tenant)
         let dependentSalesUpdated = 0;
         const allQueueItems = await db.syncQueue.toArray();
 
         for (const item of allQueueItems) {
-            if (item.id === undefined) continue;
+            if (item.id === undefined || item.status === "SYNCED") continue;
+
+            // Strict tenant isolation check: do not touch records belonging to other tenants
+            const itemTenant = item.owner?.tenantId || (item.payload as Record<string, unknown> | undefined)?.tenantId;
+            if (itemTenant && String(itemTenant).trim() !== cleanTenantId) continue;
 
             let modified = false;
             const payload = item.payload ? { ...item.payload } : {};
 
             // Check if items array contains this productId
             if (Array.isArray(payload.items)) {
-                const newItems = payload.items.map((line: any) => {
-                    if (line && line.productId === cleanLocalId) {
+                const newItems = payload.items.map((line: unknown) => {
+                    const l = line as Record<string, unknown> | undefined;
+                    if (l && l.productId === cleanLocalId) {
                         modified = true;
-                        return { ...line, productId: cleanServerId };
+                        return { ...l, productId: cleanServerId };
                     }
                     return line;
                 });
@@ -555,6 +564,30 @@ export async function resolvePendingProductId(
                     dependsOn: newDependsOn && newDependsOn.length > 0 ? newDependsOn : undefined,
                 });
                 dependentSalesUpdated++;
+            }
+        }
+
+        // 3. Scan cachedPurchases for line items referencing localId (scoped strictly to active tenant)
+        if (db.cachedPurchases) {
+            const tenantPurchases = await db.cachedPurchases
+                .where("tenantId")
+                .equals(cleanTenantId)
+                .toArray();
+
+            for (const purchase of tenantPurchases) {
+                if (Array.isArray(purchase.items)) {
+                    let purchaseModified = false;
+                    const updatedItems = purchase.items.map((line) => {
+                        if (line && line.productId === cleanLocalId) {
+                            purchaseModified = true;
+                            return { ...line, productId: cleanServerId };
+                        }
+                        return line;
+                    });
+                    if (purchaseModified) {
+                        await db.cachedPurchases.update(purchase.id, { items: updatedItems });
+                    }
+                }
             }
         }
 

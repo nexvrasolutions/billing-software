@@ -93,7 +93,7 @@ export function backoffDelayMs(attempts: number, random: () => number = Math.ran
 
 export type SyncOutcome =
     | { kind: "success" }
-    | { kind: "retryable"; message: string; retryAfterSeconds?: number }
+    | { kind: "retryable"; message: string; retryAfterSeconds?: number; isMaintenance?: boolean }
     | { kind: "permanent"; message: string }
     /** Stop the whole run without touching the item (wrong/no session). */
     | { kind: "stop"; message: string }
@@ -131,6 +131,15 @@ export function interpretResponse(
         return { kind: "retryable", message, retryAfterSeconds: body.retryAfterSeconds };
     }
 
+    if (body?.code === "MAINTENANCE_PAUSED") {
+        return {
+            kind: "retryable",
+            message,
+            retryAfterSeconds: body.retryAfterSeconds ?? 30,
+            isMaintenance: true,
+        };
+    }
+
     if (body?.retryable === false || status === 400 || status === 422 || body?.code === "OPERATION_ID_CONFLICT") {
         return { kind: "permanent", message };
     }
@@ -146,6 +155,12 @@ export function stateAfterFailure(
     now: Date,
     random: () => number = Math.random
 ): { status: "FAILED" | "NEEDS_ATTENTION"; nextAttemptAt?: string } {
+    // Operational maintenance pause: never escalate to NEEDS_ATTENTION solely due to maintenance window
+    if (outcome.kind === "retryable" && outcome.isMaintenance) {
+        const delay = Math.max(backoffDelayMs(attempts, random), (outcome.retryAfterSeconds ?? 30) * 1000);
+        return { status: "FAILED", nextAttemptAt: new Date(now.getTime() + delay).toISOString() };
+    }
+
     if (outcome.kind === "permanent" || attempts >= MAX_CLIENT_ATTEMPTS) {
         return { status: "NEEDS_ATTENTION" };
     }
@@ -182,7 +197,13 @@ export function decideAfterOutcome(
     if (outcome.kind === "stop") return { action: "restore", stopReason: "session" };
     if (outcome.kind === "unreachable") return { action: "restore", stopReason: "unreachable" };
 
-    const attempts = previousAttempts + 1;
+    const isMaintenance = outcome.kind === "retryable" && Boolean(outcome.isMaintenance);
+    // During maintenance, do not exhaust the client retry quota.
+    // Cap attempts at MAX_CLIENT_ATTEMPTS - 1 so subsequent non-maintenance attempts still have a chance.
+    const attempts = isMaintenance
+        ? Math.min(previousAttempts, MAX_CLIENT_ATTEMPTS - 1)
+        : previousAttempts + 1;
+
     const next = stateAfterFailure(outcome, attempts, now, random);
     return { action: "failed", attempts, ...next, message: outcome.message };
 }

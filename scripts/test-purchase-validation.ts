@@ -54,12 +54,15 @@
 import {
     createPurchaseSchema,
     offlinePurchasePayloadSchema,
+    purchaseItemSchema,
+    offlinePurchaseItemSchema,
     calculatePurchaseTotals,
     isValidMongoObjectId,
     isTemporarySupplierId,
     isValidSupplierId,
+    isTemporaryProductId,
+    isValidOfflineProductId,
     parseFiniteNumber,
-    type CreatePurchaseInput,
 } from "../lib/validations/purchase";
 
 const results: { name: string; passed: boolean; detail?: string }[] = [];
@@ -85,6 +88,8 @@ const VALID_OBJECT_ID_SUPPLIER = "507f1f77bcf86cd799439011";
 const VALID_OBJECT_ID_PRODUCT_1 = "507f1f77bcf86cd799439022";
 const VALID_OBJECT_ID_PRODUCT_2 = "507f1f77bcf86cd799439033";
 const VALID_TEMP_SUPPLIER_ID = "sup_12345678-abcd-ef01-2345-6789abcdef01";
+const VALID_TEMP_PRODUCT_ID_1 = "prod_12345678-abcd-ef01-2345-6789abcdef01";
+const VALID_TEMP_PRODUCT_ID_2 = "prod_client_pos_999";
 
 function run() {
     console.log("=== TEST SUITE: PURCHASE MODULE VALIDATION & CALCULATIONS ===\n");
@@ -296,6 +301,99 @@ function run() {
         }).success
     );
 
+    // Temporary product ID helpers
+    check("3.1.6 Temporary product ID UUID format recognized by helper", isTemporaryProductId(VALID_TEMP_PRODUCT_ID_1));
+    check("3.1.7 Temporary product ID custom format recognized by helper", isTemporaryProductId(VALID_TEMP_PRODUCT_ID_2));
+    check("3.1.8 isTemporaryProductId case-insensitive recognition", isTemporaryProductId("PROD_UUID_456"));
+    check("3.1.9 isTemporaryProductId rejects empty suffix prod_", !isTemporaryProductId("prod_"));
+    check("3.1.10 isTemporaryProductId rejects temporary supplier ID", !isTemporaryProductId(VALID_TEMP_SUPPLIER_ID));
+    check("3.1.11 isTemporaryProductId rejects temporary customer ID", !isTemporaryProductId("cust_12345_uuid"));
+    check("3.1.12 isTemporaryProductId rejects arbitrary non-prod string", !isTemporaryProductId("product-123"));
+    check("3.1.13 isTemporaryProductId rejects server MongoDB ObjectId", !isTemporaryProductId(VALID_OBJECT_ID_PRODUCT_1));
+    check("3.1.14 isValidOfflineProductId accepts valid 24-hex ObjectId", isValidOfflineProductId(VALID_OBJECT_ID_PRODUCT_1));
+    check("3.1.15 isValidOfflineProductId accepts valid temporary product ID", isValidOfflineProductId(VALID_TEMP_PRODUCT_ID_1));
+    check("3.1.16 isValidOfflineProductId rejects malformed hex", !isValidOfflineProductId("507f1f77bcf86cd79943901"));
+    check("3.1.17 isValidOfflineProductId rejects arbitrary string", !isValidOfflineProductId("invalid-product-id"));
+
+    // 3.7 Direct Item Schema Testing (purchaseItemSchema vs offlinePurchaseItemSchema)
+    check(
+        "3.7.1 purchaseItemSchema accepts valid MongoDB ObjectId product ID",
+        purchaseItemSchema.safeParse({ productId: VALID_OBJECT_ID_PRODUCT_1, quantity: 1, unitPrice: 100 }).success
+    );
+    check(
+        "3.7.2 purchaseItemSchema strictly REJECTS temporary product ID",
+        !purchaseItemSchema.safeParse({ productId: VALID_TEMP_PRODUCT_ID_1, quantity: 1, unitPrice: 100 }).success
+    );
+    check(
+        "3.7.3 offlinePurchaseItemSchema accepts valid MongoDB ObjectId product ID",
+        offlinePurchaseItemSchema.safeParse({ productId: VALID_OBJECT_ID_PRODUCT_1, quantity: 1, unitPrice: 100 }).success
+    );
+    check(
+        "3.7.4 offlinePurchaseItemSchema accepts valid temporary product ID",
+        offlinePurchaseItemSchema.safeParse({ productId: VALID_TEMP_PRODUCT_ID_1, quantity: 1, unitPrice: 100 }).success
+    );
+    check(
+        "3.7.5 offlinePurchaseItemSchema rejects empty suffix prod_",
+        !offlinePurchaseItemSchema.safeParse({ productId: "prod_", quantity: 1, unitPrice: 100 }).success
+    );
+    check(
+        "3.7.6 offlinePurchaseItemSchema rejects malformed temporary product ID with special chars",
+        !offlinePurchaseItemSchema.safeParse({ productId: "prod_invalid!@#", quantity: 1, unitPrice: 100 }).success
+    );
+    check(
+        "3.7.7 offlinePurchaseItemSchema rejects unsupported prefix (sup_)",
+        !offlinePurchaseItemSchema.safeParse({ productId: VALID_TEMP_SUPPLIER_ID, quantity: 1, unitPrice: 100 }).success
+    );
+    check(
+        "3.7.8 offlinePurchaseItemSchema rejects arbitrary string product ID",
+        !offlinePurchaseItemSchema.safeParse({ productId: "random-product", quantity: 1, unitPrice: 100 }).success
+    );
+    check(
+        "3.7.9 offlinePurchaseItemSchema enforces quantity > 0 on temporary product items",
+        !offlinePurchaseItemSchema.safeParse({ productId: VALID_TEMP_PRODUCT_ID_1, quantity: 0, unitPrice: 100 }).success
+    );
+    check(
+        "3.7.10 offlinePurchaseItemSchema enforces unitPrice >= 0 on temporary product items",
+        !offlinePurchaseItemSchema.safeParse({ productId: VALID_TEMP_PRODUCT_ID_1, quantity: 1, unitPrice: -10 }).success
+    );
+
+    // 3.8 Full Payload Item Product ID Validation
+    check(
+        "3.8.1 createPurchaseSchema accepts items with valid MongoDB ObjectId product IDs",
+        createPurchaseSchema.safeParse({
+            ...minimalPayload,
+            items: [{ productId: VALID_OBJECT_ID_PRODUCT_1, quantity: 2, unitPrice: 150 }],
+        }).success
+    );
+    check(
+        "3.8.2 createPurchaseSchema strictly REJECTS items with temporary product IDs",
+        !createPurchaseSchema.safeParse({
+            ...minimalPayload,
+            items: [{ productId: VALID_TEMP_PRODUCT_ID_1, quantity: 2, unitPrice: 150 }],
+        }).success
+    );
+    check(
+        "3.8.3 offlinePurchasePayloadSchema accepts items with valid MongoDB ObjectId product IDs",
+        offlinePurchasePayloadSchema.safeParse({
+            ...minimalPayload,
+            items: [{ productId: VALID_OBJECT_ID_PRODUCT_1, quantity: 2, unitPrice: 150 }],
+        }).success
+    );
+    check(
+        "3.8.4 offlinePurchasePayloadSchema accepts items with temporary product IDs",
+        offlinePurchasePayloadSchema.safeParse({
+            ...minimalPayload,
+            items: [{ productId: VALID_TEMP_PRODUCT_ID_1, quantity: 2, unitPrice: 150 }],
+        }).success
+    );
+    check(
+        "3.8.5 offlinePurchasePayloadSchema rejects items with malformed product ID",
+        !offlinePurchasePayloadSchema.safeParse({
+            ...minimalPayload,
+            items: [{ productId: "prod_", quantity: 2, unitPrice: 150 }],
+        }).success
+    );
+
     // ============================================================
     // SECTION 4: Numeric Bounds (Quantities and Prices)
     // ============================================================
@@ -361,7 +459,7 @@ function run() {
         "4.8 String type for quantity rejected",
         !createPurchaseSchema.safeParse({
             ...minimalPayload,
-            items: [{ productId: VALID_OBJECT_ID_PRODUCT_1, quantity: "1" as any, unitPrice: 100 }],
+            items: [{ productId: VALID_OBJECT_ID_PRODUCT_1, quantity: "1" as unknown as number, unitPrice: 100 }],
         }).success
     );
 
@@ -520,7 +618,7 @@ function run() {
 
     check(
         "7.7 Invalid paymentStatus enum rejected",
-        !createPurchaseSchema.safeParse({ ...minimalPayload, paymentStatus: "completed" as any }).success
+        !createPurchaseSchema.safeParse({ ...minimalPayload, paymentStatus: "completed" as unknown as "paid" }).success
     );
 
     // ============================================================
@@ -564,7 +662,7 @@ function run() {
         "9.3 Unrecognized item property rejected by strict item schema",
         !createPurchaseSchema.safeParse({
             ...minimalPayload,
-            items: [{ productId: VALID_OBJECT_ID_PRODUCT_1, quantity: 1, unitPrice: 100, malicious: true } as any],
+            items: [{ productId: VALID_OBJECT_ID_PRODUCT_1, quantity: 1, unitPrice: 100, malicious: true } as unknown as { productId: string; quantity: number; unitPrice: number }],
         }).success
     );
 
@@ -635,6 +733,121 @@ function run() {
     check(
         "10.8 Resolved offline payload with server MongoDB ObjectId succeeds with createPurchaseSchema",
         createPurchaseSchema.safeParse(resolvedOfflinePayload).success
+    );
+
+    // 10.9 Offline payload with BOTH temporary supplierId AND temporary productId
+    const fullyOfflinePayload = {
+        ...offlinePayload,
+        items: [
+            {
+                productId: VALID_TEMP_PRODUCT_ID_1,
+                quantity: 10,
+                unitPrice: 200,
+                discountRate: 5,
+                taxRate: 18,
+                productSnapshot: {
+                    name: "Offline Created Widget",
+                    SKU: "WID-OFFLINE-001",
+                    unit: "PCS",
+                },
+            },
+        ],
+        subtotal: 2000,
+        discountTotal: 100,
+        taxTotal: 342,
+        shippingCost: 50,
+        grandTotal: 2292,
+        paidAmount: 500,
+        paymentStatus: "partial" as const,
+    };
+
+    const resFullyOffline = offlinePurchasePayloadSchema.safeParse(fullyOfflinePayload);
+    check("10.9 Offline payload with BOTH temporary supplierId AND temporary productId succeeds with offlinePurchasePayloadSchema", resFullyOffline.success);
+    if (resFullyOffline.success) {
+        check("10.9.1 Temporary supplierId preserved", resFullyOffline.data.supplierId === VALID_TEMP_SUPPLIER_ID);
+        check("10.9.2 Temporary productId preserved in line items", resFullyOffline.data.items[0].productId === VALID_TEMP_PRODUCT_ID_1);
+        check("10.9.3 Item productSnapshot preserved for offline product", resFullyOffline.data.items[0].productSnapshot?.SKU === "WID-OFFLINE-001");
+    }
+
+    check(
+        "10.10 Offline payload with temporary productId is rejected by createPurchaseSchema",
+        !createPurchaseSchema.safeParse(fullyOfflinePayload).success
+    );
+
+    // 10.11 Supplier resolved to server ObjectId, but productId still temporary -> server schema MUST still reject
+    const partiallyResolvedPayload = {
+        ...fullyOfflinePayload,
+        supplierId: VALID_OBJECT_ID_SUPPLIER,
+        supplierCode: "SUP-0005",
+    };
+    check(
+        "10.11 Supplier resolved but productId still temporary is rejected by createPurchaseSchema",
+        !createPurchaseSchema.safeParse(partiallyResolvedPayload).success
+    );
+
+    // 10.12 Both supplier and product resolved to server ObjectIds -> server schema MUST succeed
+    const fullyResolvedPayload = {
+        ...partiallyResolvedPayload,
+        items: [
+            {
+                ...partiallyResolvedPayload.items[0],
+                productId: VALID_OBJECT_ID_PRODUCT_1,
+            },
+        ],
+    };
+    check(
+        "10.12 Both supplier and product resolved to server ObjectIds succeeds with createPurchaseSchema",
+        createPurchaseSchema.safeParse(fullyResolvedPayload).success
+    );
+
+    // 10.13 Offline payload with mixed server and temporary product IDs succeeds
+    const mixedProductsOfflinePayload = {
+        ...offlinePayload,
+        items: [
+            {
+                productId: VALID_OBJECT_ID_PRODUCT_1,
+                quantity: 5,
+                unitPrice: 100,
+            },
+            {
+                productId: VALID_TEMP_PRODUCT_ID_2,
+                quantity: 3,
+                unitPrice: 150,
+            },
+        ],
+        subtotal: 950,
+        discountTotal: 0,
+        taxTotal: 0,
+        shippingCost: 0,
+        grandTotal: 950,
+        paidAmount: 0,
+    };
+    check(
+        "10.13 Offline payload with mixed server and temporary product IDs satisfies offlinePurchasePayloadSchema",
+        offlinePurchasePayloadSchema.safeParse(mixedProductsOfflinePayload).success
+    );
+
+    // 10.14 Invalid financial values with temporary product IDs in offline schema are still rejected
+    check(
+        "10.14.1 Zero quantity with temporary product ID rejected in offline schema",
+        !offlinePurchasePayloadSchema.safeParse({
+            ...mixedProductsOfflinePayload,
+            items: [{ productId: VALID_TEMP_PRODUCT_ID_1, quantity: 0, unitPrice: 100 }],
+        }).success
+    );
+    check(
+        "10.14.2 Negative unit price with temporary product ID rejected in offline schema",
+        !offlinePurchasePayloadSchema.safeParse({
+            ...mixedProductsOfflinePayload,
+            items: [{ productId: VALID_TEMP_PRODUCT_ID_1, quantity: 1, unitPrice: -50 }],
+        }).success
+    );
+    check(
+        "10.14.3 Paid amount exceeding grand total with temporary product ID rejected in offline schema",
+        !offlinePurchasePayloadSchema.safeParse({
+            ...mixedProductsOfflinePayload,
+            paidAmount: 999999,
+        }).success
     );
 
     // ============================================================

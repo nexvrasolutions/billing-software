@@ -13,6 +13,11 @@ import { publicErrorMessage } from "@/lib/api/publicError";
 import { connectDB } from "@/lib/db/mongodb";
 import { Purchase } from "@/lib/models/Purchase";
 import { createPurchaseSchema } from "@/lib/validations/purchase";
+import {
+    isPurchaseWritePaused,
+    createMaintenancePausedResponse,
+    isMaintenancePausedError,
+} from "@/lib/config/writePause";
 
 export async function GET(request: NextRequest) {
     try {
@@ -80,6 +85,11 @@ export async function POST(
 
         if (denied) {
             return denied;
+        }
+
+        // 1c. Maintenance check: reject purchase creation when write-pause is active
+        if (isPurchaseWritePaused()) {
+            return createMaintenancePausedResponse();
         }
 
         // 2. Convert trusted session IDs to MongoDB ObjectIds
@@ -164,6 +174,10 @@ export async function POST(
             { status: alreadyProcessed ? 200 : 201 }
         );
     } catch (error) {
+        if (isMaintenancePausedError(error)) {
+            return createMaintenancePausedResponse(error.message, error.retryAfterSeconds);
+        }
+
         console.error(
             "PURCHASE API ERROR:",
             error

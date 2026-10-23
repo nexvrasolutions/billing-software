@@ -4,6 +4,7 @@ import { FormEvent, useCallback, useEffect, useState } from "react";
 import Link from "next/link";
 
 import { Button } from "@/components/ui/button";
+import { AppShell } from "@/components/layout/AppShell";
 import { confirmServerSession, endOfflineAccess, isSessionRejected } from "@/lib/offline/sessionIdentity";
 
 /*
@@ -216,29 +217,32 @@ export default function UsersPage() {
 
     if (authRequired) {
         return (
-            <main className="mx-auto w-full max-w-5xl px-4 py-10">
-                <h1 className="text-2xl font-semibold">User Management</h1>
-                {passwordChangeRequired ? (
-                    <p className="mt-4" role="alert">
-                        You must change your temporary password before using this page.{" "}
-                        <Link className="underline" href="/account">
-                            Change password
-                        </Link>
-                    </p>
-                ) : (
-                    <p className="mt-4">
-                        Your session has expired or you are not logged in.{" "}
-                        <Link className="underline" href="/login">
-                            Log in
-                        </Link>
-                    </p>
-                )}
-            </main>
+            <AppShell>
+                <main className="mx-auto w-full max-w-5xl px-4 py-10">
+                    <h1 className="text-2xl font-semibold">User Management</h1>
+                    {passwordChangeRequired ? (
+                        <p className="mt-4" role="alert">
+                            You must change your temporary password before using this page.{" "}
+                            <Link className="underline" href="/account">
+                                Change password
+                            </Link>
+                        </p>
+                    ) : (
+                        <p className="mt-4">
+                            Your session has expired or you are not logged in.{" "}
+                            <Link className="underline" href="/login">
+                                Log in
+                            </Link>
+                        </p>
+                    )}
+                </main>
+            </AppShell>
         );
     }
 
     return (
-        <main className="mx-auto w-full max-w-5xl px-4 py-10">
+        <AppShell>
+            <main className="mx-auto w-full max-w-5xl px-4 py-10">
             <div className="flex flex-wrap items-center justify-between gap-3">
                 <h1 className="text-2xl font-semibold">User Management</h1>
                 <div className="flex items-center gap-3">
@@ -434,6 +438,7 @@ export default function UsersPage() {
                 </div>
             )}
         </main>
+        </AppShell>
     );
 }
 

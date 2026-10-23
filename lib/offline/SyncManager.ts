@@ -20,6 +20,7 @@ import { summarizeQueue, type QueueSummary } from "./queueStatus";
 import {
     resolvePendingProductId,
     markPendingProductNeedsAttention,
+    makeCachedProductId,
 } from "./productCatalogueCache";
 import {
     makeCachedCustomerId,
@@ -34,6 +35,12 @@ import {
     ensurePendingSuppliersQueued,
     isTemporarySupplierId,
 } from "./supplierCache";
+import {
+    reconcileConfirmedPurchaseSync,
+    markCachedPurchaseFailed,
+    ensurePendingPurchasesQueued,
+} from "./purchaseCache";
+import { isTemporaryProductId } from "../validations/purchase";
 import { normalizeSupplierUpdatePayload } from "../validations/syncOperations";
 
 const SYNC_LOCK_NAME = "billing-offline-sync";
@@ -61,13 +68,31 @@ export interface SyncRunResult {
     remaining?: QueueSummary;
 }
 
+interface SyncProcessResponseData {
+    result?: {
+        _id?: string;
+        invoiceNo?: string;
+        purchaseNo?: string;
+        supplierId?: string;
+        supplierCode?: string;
+    };
+    entityId?: string;
+    product?: { _id?: string };
+    customer?: { _id?: string };
+    supplier?: { _id?: string };
+    supplierCode?: string;
+    sale?: { id?: string; _id?: string; invoiceNo?: string };
+    purchase?: { _id?: string; purchaseNo?: string };
+    operation?: { entityId?: string };
+}
+
 /** Read-only summary of the items owned by this account. */
 async function remainingFor(identity: SessionIdentity): Promise<QueueSummary> {
     const items = await offlineDB.syncQueue.where("ownerUserId").equals(identity.userId).toArray();
     return summarizeQueue(items.filter((item) => isOwnedBy(item, identity)));
 }
 
-async function postJson(path: string, body: unknown): Promise<{ outcome: SyncOutcome; data: any }> {
+async function postJson(path: string, body: unknown): Promise<{ outcome: SyncOutcome; data: Record<string, unknown> }> {
     try {
         const response = await fetch(path, {
             method: "POST",
@@ -77,7 +102,7 @@ async function postJson(path: string, body: unknown): Promise<{ outcome: SyncOut
             body: JSON.stringify(body),
             signal: AbortSignal.timeout(SYNC_REQUEST_TIMEOUT_MS),
         });
-        const data = await response.json().catch(() => ({}));
+        const data = (await response.json().catch(() => ({}))) as Record<string, unknown>;
         return { outcome: interpretResponse(response.status, data), data };
     } catch {
         // No answer from the server (no connection, interrupted request,
@@ -103,7 +128,7 @@ async function syncOne(item: SyncQueueItem, identity: SessionIdentity): Promise<
     const id = item.id!;
     await markSyncing(id);
 
-    // Safety check for dependent Purchase: ensure supplier ID is valid server ID before uploading to server
+    // Safety check for dependent Purchase: ensure supplier ID and product IDs are valid server IDs before uploading to server
     if (item.entityType === "Purchase") {
         const rawSupId = typeof item.payload?.supplierId === "string" ? item.payload.supplierId.trim() : "";
         if (rawSupId && isTemporarySupplierId(rawSupId)) {
@@ -116,6 +141,15 @@ async function syncOne(item: SyncQueueItem, identity: SessionIdentity): Promise<
                     item.attempts,
                     "NEEDS_ATTENTION",
                     `Dependent supplier creation requires attention: ${cached.errorMessage || "Validation or conflict error"}. Resolve supplier before syncing this purchase.`
+                );
+                await markCachedPurchaseFailed(
+                    {
+                        operationId: item.operationId,
+                        tenantId: identity.tenantId,
+                        status: "NEEDS_ATTENTION",
+                        errorMessage: `Dependent supplier creation requires attention: ${cached.errorMessage || "Validation or conflict error"}`,
+                    },
+                    offlineDB
                 );
                 return {
                     operationId: item.operationId,
@@ -132,6 +166,15 @@ async function syncOne(item: SyncQueueItem, identity: SessionIdentity): Promise<
                     "NEEDS_ATTENTION",
                     `Dependent temporary supplier ${rawSupId} not found in offline cache. Cannot safely sync purchase.`
                 );
+                await markCachedPurchaseFailed(
+                    {
+                        operationId: item.operationId,
+                        tenantId: identity.tenantId,
+                        status: "NEEDS_ATTENTION",
+                        errorMessage: `Dependent temporary supplier ${rawSupId} not found in offline cache`,
+                    },
+                    offlineDB
+                );
                 return {
                     operationId: item.operationId,
                     status: "NEEDS_ATTENTION",
@@ -141,6 +184,127 @@ async function syncOne(item: SyncQueueItem, identity: SessionIdentity): Promise<
             }
 
             // Supplier is still pending synchronization; defer purchase upload without counting an attempt
+            await releaseItem(id, item.status === "FAILED" ? "FAILED" : "PENDING", { lastAttemptAt: item.lastAttemptAt });
+            return { operationId: item.operationId, status: "SKIPPED", attempts: item.attempts };
+        }
+
+        // Check for temporary product IDs in line items
+        const lineItems = Array.isArray(item.payload?.items) ? item.payload.items : [];
+        for (const line of lineItems) {
+            const lineProdId = typeof (line as Record<string, unknown> | undefined)?.productId === "string"
+                ? String((line as Record<string, unknown>).productId).trim()
+                : "";
+
+            if (lineProdId && isTemporaryProductId(lineProdId)) {
+                const cachedProdKey = makeCachedProductId(identity.tenantId, lineProdId);
+                const cachedProd = await offlineDB.cachedProducts.get(cachedProdKey);
+
+                if (cachedProd && cachedProd.syncStatus === "NEEDS_ATTENTION") {
+                    await markAttemptFailed(
+                        id,
+                        item.attempts,
+                        "NEEDS_ATTENTION",
+                        `Dependent product creation requires attention: ${cachedProd.errorMessage || "Validation or conflict error"}. Resolve product before syncing this purchase.`
+                    );
+                    await markCachedPurchaseFailed(
+                        {
+                            operationId: item.operationId,
+                            tenantId: identity.tenantId,
+                            status: "NEEDS_ATTENTION",
+                            errorMessage: `Dependent product creation requires attention: ${cachedProd.errorMessage || "Validation or conflict error"}`,
+                        },
+                        offlineDB
+                    );
+                    return {
+                        operationId: item.operationId,
+                        status: "NEEDS_ATTENTION",
+                        attempts: item.attempts + 1,
+                        error: "Dependent product creation requires attention",
+                    };
+                }
+
+                if (!cachedProd) {
+                    await markAttemptFailed(
+                        id,
+                        item.attempts,
+                        "NEEDS_ATTENTION",
+                        `Dependent temporary product ${lineProdId} not found in offline cache. Cannot safely sync purchase.`
+                    );
+                    await markCachedPurchaseFailed(
+                        {
+                            operationId: item.operationId,
+                            tenantId: identity.tenantId,
+                            status: "NEEDS_ATTENTION",
+                            errorMessage: `Dependent temporary product ${lineProdId} not found in offline cache`,
+                        },
+                        offlineDB
+                    );
+                    return {
+                        operationId: item.operationId,
+                        status: "NEEDS_ATTENTION",
+                        attempts: item.attempts + 1,
+                        error: "Dependent product not found",
+                    };
+                }
+
+                // Product is still pending synchronization; defer purchase upload without counting an attempt
+                await releaseItem(id, item.status === "FAILED" ? "FAILED" : "PENDING", { lastAttemptAt: item.lastAttemptAt });
+                return { operationId: item.operationId, status: "SKIPPED", attempts: item.attempts };
+            }
+        }
+
+        // Check explicit dependencies in item.dependsOn
+        if (Array.isArray(item.dependsOn) && item.dependsOn.length > 0) {
+            for (const depOpId of item.dependsOn) {
+                const depWhere = offlineDB.syncQueue.where("operationId").equals(depOpId);
+                const depItem = typeof depWhere.first === "function"
+                    ? await depWhere.first()
+                    : (await depWhere.toArray())[0];
+
+                if (depItem) {
+                    if (depItem.status === "NEEDS_ATTENTION") {
+                        await markAttemptFailed(
+                            id,
+                            item.attempts,
+                            "NEEDS_ATTENTION",
+                            `Prerequisite operation '${depOpId}' requires attention. Resolve dependency before syncing this purchase.`
+                        );
+                        await markCachedPurchaseFailed(
+                            {
+                                operationId: item.operationId,
+                                tenantId: identity.tenantId,
+                                status: "NEEDS_ATTENTION",
+                                errorMessage: `Prerequisite operation '${depOpId}' requires attention`,
+                            },
+                            offlineDB
+                        );
+                        return {
+                            operationId: item.operationId,
+                            status: "NEEDS_ATTENTION",
+                            attempts: item.attempts + 1,
+                            error: "Prerequisite operation requires attention",
+                        };
+                    }
+
+                    if (depItem.status !== "SYNCED") {
+                        // Prerequisite is still pending synchronization; defer purchase upload without counting an attempt
+                        await releaseItem(id, item.status === "FAILED" ? "FAILED" : "PENDING", { lastAttemptAt: item.lastAttemptAt });
+                        return { operationId: item.operationId, status: "SKIPPED", attempts: item.attempts };
+                    }
+                }
+            }
+        }
+
+        // Absolute safety gate: ensure no unresolved temporary supplier or product ID is submitted
+        const finalSupId = typeof item.payload?.supplierId === "string" ? item.payload.supplierId.trim() : "";
+        const hasUnresolvedTemp =
+            isTemporarySupplierId(finalSupId) ||
+            lineItems.some((it: unknown) => {
+                const pid = (it as Record<string, unknown> | undefined)?.productId;
+                return typeof pid === "string" && isTemporaryProductId(pid);
+            });
+
+        if (hasUnresolvedTemp) {
             await releaseItem(id, item.status === "FAILED" ? "FAILED" : "PENDING", { lastAttemptAt: item.lastAttemptAt });
             return { operationId: item.operationId, status: "SKIPPED", attempts: item.attempts };
         }
@@ -163,21 +327,21 @@ async function syncOne(item: SyncQueueItem, identity: SessionIdentity): Promise<
         }
     }
 
-    let { outcome, data: uploadData } = await postJson("/api/sync-operations", {
+    const uploadRes = await postJson("/api/sync-operations", {
         operationId: item.operationId,
         operationType: item.operationType,
         entityType: item.entityType,
         payload: uploadPayload,
         owner: identity,
     });
-
-    let processData: any = uploadData;
+    let outcome = uploadRes.outcome;
+    let processData: SyncProcessResponseData = uploadRes.data as SyncProcessResponseData;
 
     // 2. Ask the server to apply it.
     if (outcome.kind === "success") {
         const res = await postJson("/api/sync-operations/process", { operationId: item.operationId });
         outcome = res.outcome;
-        processData = res.data;
+        processData = res.data as SyncProcessResponseData;
     }
 
     const decision = decideAfterOutcome(outcome, item.attempts, new Date());
@@ -288,6 +452,30 @@ async function syncOne(item: SyncQueueItem, identity: SessionIdentity): Promise<
             }
         }
 
+        // If this was a Purchase, reconcile the server permanent purchase number and server purchase ID locally
+        if (item.entityType === "Purchase") {
+            const serverPurchaseId = String(
+                processData?.result?._id ||
+                processData?.entityId ||
+                processData?.purchase?._id ||
+                processData?.operation?.entityId ||
+                ""
+            ).trim();
+            const serverPurchaseNo = processData?.result?.purchaseNo || processData?.purchase?.purchaseNo;
+
+            if (serverPurchaseId) {
+                await reconcileConfirmedPurchaseSync(
+                    {
+                        operationId: item.operationId,
+                        tenantId: identity.tenantId,
+                        serverPurchaseId,
+                        serverPurchaseNo: serverPurchaseNo ? String(serverPurchaseNo) : undefined,
+                    },
+                    offlineDB
+                );
+            }
+        }
+
         return { operationId: item.operationId, status: "SYNCED", attempts: item.attempts + 1 };
     }
 
@@ -312,7 +500,7 @@ async function syncOne(item: SyncQueueItem, identity: SessionIdentity): Promise<
             );
         }
 
-        // Cascade NEEDS_ATTENTION to dependent sales in syncQueue
+        // Cascade NEEDS_ATTENTION to dependent sales and purchases in syncQueue
         const dependents = await offlineDB.syncQueue
             .filter((q) => Boolean(q.dependsOn && q.dependsOn.includes(item.operationId)))
             .toArray();
@@ -323,8 +511,19 @@ async function syncOne(item: SyncQueueItem, identity: SessionIdentity): Promise<
                     dep.id,
                     dep.attempts,
                     "NEEDS_ATTENTION",
-                    `Dependent product creation failed: ${decision.message}. Resolve the product conflict to sync this sale.`
+                    `Dependent product creation failed: ${decision.message}. Resolve the product conflict to sync this operation.`
                 );
+                if (dep.entityType === "Purchase") {
+                    await markCachedPurchaseFailed(
+                        {
+                            operationId: dep.operationId,
+                            tenantId: identity.tenantId,
+                            status: "NEEDS_ATTENTION",
+                            errorMessage: `Dependent product creation failed: ${decision.message}`,
+                        },
+                        offlineDB
+                    );
+                }
             }
         }
     }
@@ -387,8 +586,30 @@ async function syncOne(item: SyncQueueItem, identity: SessionIdentity): Promise<
                     "NEEDS_ATTENTION",
                     `Dependent supplier creation failed: ${decision.message}. Resolve the supplier conflict to sync this purchase.`
                 );
+                await markCachedPurchaseFailed(
+                    {
+                        operationId: dep.operationId,
+                        tenantId: identity.tenantId,
+                        status: "NEEDS_ATTENTION",
+                        errorMessage: `Dependent supplier creation failed: ${decision.message}`,
+                    },
+                    offlineDB
+                );
             }
         }
+    }
+
+    // If a Purchase failed permanently (e.g. NEEDS_ATTENTION), cascade to cached purchase
+    if (item.entityType === "Purchase" && decision.status === "NEEDS_ATTENTION") {
+        await markCachedPurchaseFailed(
+            {
+                operationId: item.operationId,
+                tenantId: identity.tenantId,
+                status: "NEEDS_ATTENTION",
+                errorMessage: decision.message,
+            },
+            offlineDB
+        );
     }
 
     return { operationId: item.operationId, status: decision.status, attempts: decision.attempts, error: decision.message };
@@ -414,13 +635,14 @@ async function runSync(holdsExclusiveLock: boolean): Promise<SyncRunResult> {
     await recoverInterrupted(identity, holdsExclusiveLock);
     await ensurePendingCustomersQueued(identity.tenantId, offlineDB, identity);
     await ensurePendingSuppliersQueued(identity.tenantId, offlineDB, identity);
+    await ensurePendingPurchasesQueued(identity.tenantId, offlineDB, identity);
 
     const userCandidates = await offlineDB.syncQueue.where("ownerUserId").equals(identity.userId).toArray();
     const allQueue = await offlineDB.syncQueue.toArray();
     const unownedForTenant = allQueue.filter((item) => {
         if (item.status !== "PENDING" && item.status !== "FAILED") return false;
         if (item.ownerUserId === identity.userId && item.owner?.deviceId === identity.deviceId) return false;
-        const itemTenant = item.owner?.tenantId || (item.payload as any)?.tenantId;
+        const itemTenant = item.owner?.tenantId || (item.payload as Record<string, unknown> | undefined)?.tenantId;
         return itemTenant === identity.tenantId;
     });
 

@@ -1125,7 +1125,11 @@ export async function resolvePendingSupplierId(
         return { resolved: false, dependentPurchasesUpdated: 0 };
     }
 
-    return await db.transaction("rw", db.cachedSuppliers, db.syncQueue, async () => {
+    const tables = db.cachedPurchases
+        ? [db.cachedSuppliers, db.syncQueue, db.cachedPurchases]
+        : [db.cachedSuppliers, db.syncQueue];
+
+    return await db.transaction("rw", tables, async () => {
         // 1. Update cachedSuppliers table
         const oldKey = makeCachedSupplierId(cleanTenantId, cleanLocalId);
         const existingRecord = await db.cachedSuppliers.get(oldKey);
@@ -1244,6 +1248,23 @@ export async function resolvePendingSupplierId(
                     payload,
                     dependsOn: newDependsOn && newDependsOn.length > 0 ? newDependsOn : undefined,
                 });
+            }
+        }
+
+        // 3. Scan cachedPurchases for records referencing local supplier ID (scoped strictly to active tenant)
+        if (db.cachedPurchases) {
+            const tenantPurchases = await db.cachedPurchases
+                .where("tenantId")
+                .equals(cleanTenantId)
+                .toArray();
+
+            for (const purchase of tenantPurchases) {
+                if (purchase.supplierId === cleanLocalId) {
+                    await db.cachedPurchases.update(purchase.id, {
+                        supplierId: cleanServerId,
+                        ...(cleanCode ? { supplierCode: cleanCode } : {}),
+                    });
+                }
             }
         }
 

@@ -123,6 +123,7 @@ export async function GET(request: NextRequest) {
                     null,
                 mustChangePassword:
                     user.mustChangePassword === true,
+                isOwner: Boolean(tenant.ownerUserId && tenant.ownerUserId.toString() === user._id.toString()),
             },
             tenant: {
                 id: tenant._id.toString(),
