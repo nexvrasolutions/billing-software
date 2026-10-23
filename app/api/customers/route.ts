@@ -5,7 +5,7 @@ import { connectDB, isDatabaseConnectionError } from "@/lib/db/mongodb";
 import { Customer } from "@/lib/models/Customer";
 import { getAuthenticatedContext } from "@/lib/auth/getAuthenticatedContext";
 import { getGrantedPermissions } from "@/lib/auth/hasPermission";
-import { createCustomerSchema, CUSTOMER_WRITE_PERMISSIONS } from "@/lib/validations/customer";
+import { createCustomerSchema, CUSTOMER_WRITE_PERMISSIONS, CUSTOMER_READ_PERMISSIONS } from "@/lib/validations/customer";
 import { AuditLogService } from "@/lib/services/AuditLogService";
 
 export async function GET(request: NextRequest) {
@@ -15,6 +15,27 @@ export async function GET(request: NextRequest) {
             return NextResponse.json(
                 { success: false, message: "Authentication required" },
                 { status: 401 }
+            );
+        }
+
+        if (!auth.roleId) {
+            return NextResponse.json(
+                { success: false, message: "Missing assigned role" },
+                { status: 403 }
+            );
+        }
+
+        const granted = await getGrantedPermissions({
+            userId: auth.userId,
+            tenantId: auth.tenantId,
+            roleId: auth.roleId,
+            permissions: CUSTOMER_READ_PERMISSIONS,
+        });
+
+        if (granted.size === 0) {
+            return NextResponse.json(
+                { success: false, message: "You do not have permission to view customers" },
+                { status: 403 }
             );
         }
 
@@ -82,21 +103,25 @@ export async function POST(request: NextRequest) {
             );
         }
 
-        // Verify role authorization when roleId is present
-        if (auth.roleId) {
-            const granted = await getGrantedPermissions({
-                userId: auth.userId,
-                tenantId: auth.tenantId,
-                roleId: auth.roleId,
-                permissions: CUSTOMER_WRITE_PERMISSIONS,
-            });
+        if (!auth.roleId) {
+            return NextResponse.json(
+                { success: false, message: "Missing assigned role" },
+                { status: 403 }
+            );
+        }
 
-            if (granted.size === 0) {
-                return NextResponse.json(
-                    { success: false, message: "You do not have permission to create customers" },
-                    { status: 403 }
-                );
-            }
+        const granted = await getGrantedPermissions({
+            userId: auth.userId,
+            tenantId: auth.tenantId,
+            roleId: auth.roleId,
+            permissions: CUSTOMER_WRITE_PERMISSIONS,
+        });
+
+        if (granted.size === 0) {
+            return NextResponse.json(
+                { success: false, message: "You do not have permission to create customers" },
+                { status: 403 }
+            );
         }
 
         let body: unknown;

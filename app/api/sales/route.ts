@@ -24,6 +24,25 @@ export async function GET(request: NextRequest) {
             );
         }
 
+        if (!context.roleId) {
+            return NextResponse.json(
+                { success: false, message: "Permission denied" },
+                { status: 403 }
+            );
+        }
+
+        const granted = await getGrantedBusinessPermissions(context, [
+            BUSINESS_PERMISSIONS.salesRead,
+            BUSINESS_PERMISSIONS.salesCreate,
+        ]);
+
+        if (!granted.has(BUSINESS_PERMISSIONS.salesRead) && !granted.has(BUSINESS_PERMISSIONS.salesCreate)) {
+            return NextResponse.json(
+                { success: false, message: "You do not have permission to view sales" },
+                { status: 403 }
+            );
+        }
+
         await connectDB();
         const sales = await Sale.find({
             tenantId: new mongoose.Types.ObjectId(context.tenantId),

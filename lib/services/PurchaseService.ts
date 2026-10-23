@@ -6,6 +6,7 @@ import { Supplier } from "@/lib/models/Supplier";
 import { Unit } from "@/lib/models/Unit";
 import { StockService } from "@/lib/services/StockService";
 import { AuditLogService } from "@/lib/services/AuditLogService";
+import { isPurchaseWritePaused, MaintenancePausedError } from "@/lib/config/writePause";
 
 /* =========================
    User Context
@@ -91,6 +92,10 @@ export class PurchaseService {
 
         const normalizedOperationId =
             operationId?.trim() || undefined;
+
+        if (isPurchaseWritePaused()) {
+            throw new MaintenancePausedError();
+        }
 
         const session =
             await mongoose.startSession();

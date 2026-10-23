@@ -4,6 +4,21 @@ import { GSTIN_PATTERN } from "@/lib/tax";
 export const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 export const PAN_PATTERN = /^[A-Z]{5}[0-9]{4}[A-Z]$/;
 
+export const SUPPLIER_WRITE_PERMISSIONS = [
+    "purchases.create",
+    "products.create",
+    "products.update",
+    "users.read",
+];
+
+export const SUPPLIER_READ_PERMISSIONS = [
+    "purchases.read",
+    "purchases.create",
+    "products.create",
+    "products.update",
+    "users.read",
+];
+
 // Helper to normalize strings: trims and converts empty strings to undefined
 const optionalTrimmedString = (maxLen: number) =>
     z

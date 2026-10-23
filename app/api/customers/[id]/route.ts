@@ -15,6 +15,7 @@ import {
     isValidCustomerTransition,
     updateCustomerSchema,
     CUSTOMER_WRITE_PERMISSIONS,
+    CUSTOMER_READ_PERMISSIONS,
     type CustomerLifecycleAction,
 } from "@/lib/validations/customer";
 
@@ -32,6 +33,27 @@ export async function GET(
             return NextResponse.json(
                 { success: false, message: "Authentication required" },
                 { status: 401 }
+            );
+        }
+
+        if (!auth.roleId) {
+            return NextResponse.json(
+                { success: false, message: "Missing assigned role" },
+                { status: 403 }
+            );
+        }
+
+        const granted = await getGrantedPermissions({
+            userId: auth.userId,
+            tenantId: auth.tenantId,
+            roleId: auth.roleId,
+            permissions: CUSTOMER_READ_PERMISSIONS,
+        });
+
+        if (granted.size === 0) {
+            return NextResponse.json(
+                { success: false, message: "You do not have permission to view customer details" },
+                { status: 403 }
             );
         }
 
@@ -99,21 +121,25 @@ export async function PUT(
             );
         }
 
-        // Verify role authorization when roleId is present
-        if (auth.roleId) {
-            const granted = await getGrantedPermissions({
-                userId: auth.userId,
-                tenantId: auth.tenantId,
-                roleId: auth.roleId,
-                permissions: CUSTOMER_WRITE_PERMISSIONS,
-            });
+        if (!auth.roleId) {
+            return NextResponse.json(
+                { success: false, message: "Missing assigned role" },
+                { status: 403 }
+            );
+        }
 
-            if (granted.size === 0) {
-                return NextResponse.json(
-                    { success: false, message: "You do not have permission to update customers" },
-                    { status: 403 }
-                );
-            }
+        const granted = await getGrantedPermissions({
+            userId: auth.userId,
+            tenantId: auth.tenantId,
+            roleId: auth.roleId,
+            permissions: CUSTOMER_WRITE_PERMISSIONS,
+        });
+
+        if (granted.size === 0) {
+            return NextResponse.json(
+                { success: false, message: "You do not have permission to update customers" },
+                { status: 403 }
+            );
         }
 
         const { id } = await context.params;
@@ -309,21 +335,25 @@ export async function PATCH(
             );
         }
 
-        // Verify role authorization when roleId is present
-        if (auth.roleId) {
-            const granted = await getGrantedPermissions({
-                userId: auth.userId,
-                tenantId: auth.tenantId,
-                roleId: auth.roleId,
-                permissions: CUSTOMER_WRITE_PERMISSIONS,
-            });
+        if (!auth.roleId) {
+            return NextResponse.json(
+                { success: false, message: "Missing assigned role" },
+                { status: 403 }
+            );
+        }
 
-            if (granted.size === 0) {
-                return NextResponse.json(
-                    { success: false, message: "You do not have permission to modify customer lifecycle" },
-                    { status: 403 }
-                );
-            }
+        const granted = await getGrantedPermissions({
+            userId: auth.userId,
+            tenantId: auth.tenantId,
+            roleId: auth.roleId,
+            permissions: CUSTOMER_WRITE_PERMISSIONS,
+        });
+
+        if (granted.size === 0) {
+            return NextResponse.json(
+                { success: false, message: "You do not have permission to modify customer lifecycle" },
+                { status: 403 }
+            );
         }
 
         const { id } = await context.params;
@@ -451,21 +481,25 @@ export async function DELETE(
             );
         }
 
-        // Verify role authorization when roleId is present
-        if (auth.roleId) {
-            const granted = await getGrantedPermissions({
-                userId: auth.userId,
-                tenantId: auth.tenantId,
-                roleId: auth.roleId,
-                permissions: CUSTOMER_WRITE_PERMISSIONS,
-            });
+        if (!auth.roleId) {
+            return NextResponse.json(
+                { success: false, message: "Missing assigned role" },
+                { status: 403 }
+            );
+        }
 
-            if (granted.size === 0) {
-                return NextResponse.json(
-                    { success: false, message: "You do not have permission to delete customers" },
-                    { status: 403 }
-                );
-            }
+        const granted = await getGrantedPermissions({
+            userId: auth.userId,
+            tenantId: auth.tenantId,
+            roleId: auth.roleId,
+            permissions: CUSTOMER_WRITE_PERMISSIONS,
+        });
+
+        if (granted.size === 0) {
+            return NextResponse.json(
+                { success: false, message: "You do not have permission to delete customers" },
+                { status: 403 }
+            );
         }
 
         const { id } = await context.params;

@@ -108,6 +108,13 @@ export const CUSTOMER_WRITE_PERMISSIONS = [
     "users.read",
 ];
 
+export const CUSTOMER_READ_PERMISSIONS = [
+    "sales.create",
+    "sales.read",
+    "users.read",
+    "customers.read",
+];
+
 export const createCustomerSchema = z
     .object({
         name: z

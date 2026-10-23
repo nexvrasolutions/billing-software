@@ -50,6 +50,11 @@ import {
     publicSyncErrorMessage,
     statusAfterFailure,
 } from "./SyncErrors";
+import {
+    isPurchaseWritePaused,
+    createMaintenancePausedError,
+    isMaintenancePausedError,
+} from "@/lib/config/writePause";
 
 // ============================================================
 // TYPES
@@ -931,6 +936,13 @@ export class SyncService {
             throw new SyncProcessError(403, "PERMISSION_DENIED", message, false);
         }
 
+        // 4c. Maintenance check: reject Purchase sync processing when write-pause is active
+        if (existingOperation.entityType === "Purchase" && isPurchaseWritePaused()) {
+            throw createMaintenancePausedError(
+                "Purchase sync processing is temporarily paused for database maintenance. Please retry shortly."
+            );
+        }
+
         // 5. Claim atomically with a lease. Claimable: PENDING, FAILED, or a
         //    PROCESSING claim whose lease expired (crashed/stalled worker).
         //    Legacy PROCESSING records without a lease are reclaimable once
@@ -1178,6 +1190,23 @@ export class SyncService {
                     : undefined,
             };
         } catch (error: unknown) {
+            if (isMaintenancePausedError(error)) {
+                // Maintenance pause is operational: release the claim, restore FAILED retryable state,
+                // and neutralize the attempt increment so maintenance does not exhaust the retry budget.
+                const maintenanceMessage = publicSyncErrorMessage(error);
+                await SyncOperation.updateOne(
+                    { _id: operation._id, tenantId: user.tenantId, status: "PROCESSING", leaseToken },
+                    {
+                        $set: { status: "FAILED", failureKind: "RETRYABLE", errorMessage: maintenanceMessage },
+                        $unset: { leaseToken: "", leaseExpiresAt: "" },
+                        $inc: { attempts: -1 },
+                    }
+                ).catch(() => {
+                    // The lease simply expires; future retry recovers cleanly.
+                });
+                throw error;
+            }
+
             if (error instanceof SyncProcessError && error.code === "RETRYABLE_FAILURE") {
                 // Leave the lease in place; it expires and the retry recovers.
                 throw error;
@@ -1264,12 +1293,11 @@ export class SyncService {
             }
 
             case "Purchase": {
-                await PurchaseService.createPurchase(
+                return await PurchaseService.createPurchase(
                     businessUser,
                     parsePurchasePayload(payload),
                     operation.operationId
                 );
-                break;
             }
 
             case "SalesReturn": {

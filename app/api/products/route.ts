@@ -33,12 +33,16 @@ export async function GET(request: NextRequest) {
             );
         }
 
-        const canReadProducts = await hasPermission({
+        const grantedRead = await getGrantedPermissions({
             userId: auth.userId,
             tenantId: auth.tenantId,
             roleId: auth.roleId,
-            permission: "products.read",
+            permissions: ["products.read", "sales.create"],
         });
+
+        const canReadProducts =
+            grantedRead.has("products.read") ||
+            grantedRead.has("sales.create");
 
         if (!canReadProducts) {
             return NextResponse.json(

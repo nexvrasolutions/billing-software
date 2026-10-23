@@ -3,6 +3,7 @@ import mongoose from "mongoose";
 import { connectDB } from "@/lib/db/mongodb";
 import { Unit } from "@/lib/models/Unit";
 import { getAuthenticatedContext } from "@/lib/auth/getAuthenticatedContext";
+import { getGrantedPermissions } from "@/lib/auth/hasPermission";
 
 export async function GET(request: NextRequest) {
   try {
@@ -38,6 +39,24 @@ export async function POST(request: NextRequest) {
     const auth = await getAuthenticatedContext(request);
     if (!auth) {
       return NextResponse.json({ success: false, message: "Authentication required" }, { status: 401 });
+    }
+
+    if (!auth.roleId) {
+      return NextResponse.json({ success: false, message: "Permission denied" }, { status: 403 });
+    }
+
+    const granted = await getGrantedPermissions({
+      userId: auth.userId,
+      tenantId: auth.tenantId,
+      roleId: auth.roleId,
+      permissions: ["products.create", "units.create"],
+    });
+
+    if (granted.size === 0) {
+      return NextResponse.json(
+        { success: false, message: "You do not have permission to create units" },
+        { status: 403 }
+      );
     }
 
     const body = await request.json().catch(() => ({}));

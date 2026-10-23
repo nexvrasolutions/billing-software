@@ -184,6 +184,86 @@ export interface CachedSupplierRecord {
     errorMessage?: string;
 }
 
+export interface CachedPurchaseItem {
+    productId: string;
+    quantity: number;
+    unitPrice: number;
+    discountRate?: number;
+    taxRate?: number;
+    productSnapshot?: {
+        name?: string;
+        SKU?: string;
+        unit?: string;
+    };
+}
+
+export interface CachedPurchaseRecord {
+    // Unique key in table: `${tenantId}:${purchaseId}` for multi-tenant safety
+    id: string;
+
+    // Local client ID (e.g. `pur_${uuid}`) if pending, or server MongoDB _id once synced
+    purchaseId: string;
+
+    // Tenant boundary: queries are strictly filtered by this
+    tenantId: string;
+
+    // Operation ID of the corresponding SyncQueueItem (unique per purchase creation)
+    operationId: string;
+
+    // Purchase number (e.g. "PO-...")
+    purchaseNo: string;
+
+    // Supplier ID (server ObjectId or temporary "sup_..." ID)
+    supplierId: string;
+
+    supplierCode?: string;
+    supplierSnapshot?: {
+        name?: string;
+        supplierCode?: string;
+        phone?: string;
+        gstin?: string;
+    };
+
+    purchaseDate: string;
+    supplierInvoiceNo?: string;
+    supplierInvoiceDate?: string;
+    dueDate?: string;
+
+    warehouse: {
+        name: string;
+        location?: string;
+    };
+
+    items: CachedPurchaseItem[];
+
+    subtotal?: number;
+    discountTotal?: number;
+    taxTotal?: number;
+    shippingCost?: number;
+    grandTotal: number;
+    paidAmount: number;
+    dueAmount?: number;
+    paymentStatus?: "unpaid" | "partial" | "paid";
+
+    status: "draft" | "ordered" | "received" | "cancelled";
+    notes?: string;
+
+    // Local sequence number for ordering
+    localSeq?: number;
+
+    // ISO timestamp when this record was cached/created locally
+    cachedAt: string;
+
+    // Offline purchase creation sync status (PENDING, SYNCING, SYNCED, FAILED, or NEEDS_ATTENTION)
+    syncStatus: "PENDING" | "SYNCING" | "SYNCED" | "FAILED" | "NEEDS_ATTENTION";
+
+    // Server-confirmed MongoDB _id once synced
+    serverPurchaseId?: string;
+
+    // Error message if sync failed and needs attention
+    errorMessage?: string;
+}
+
 // Key of the last server-confirmed identity in the meta table.
 export const LAST_IDENTITY_KEY = "lastSessionIdentity";
 
@@ -194,6 +274,7 @@ export class OfflineDatabase extends Dexie {
     cachedProducts!: Table<CachedProductRecord, string>;
     cachedCustomers!: Table<CachedCustomerRecord, string>;
     cachedSuppliers!: Table<CachedSupplierRecord, string>;
+    cachedPurchases!: Table<CachedPurchaseRecord, string>;
 
     constructor() {
         super("billing_offline_db");
@@ -261,6 +342,19 @@ export class OfflineDatabase extends Dexie {
             cachedProducts: "id, tenantId, SKU, barcode, status",
             cachedCustomers: "id, tenantId, customerId, name, phone, status",
             cachedSuppliers: "id, tenantId, supplierId, supplierCode, name, phone, status",
+        });
+
+        // Version 7: offline purchase cache (isolated by tenant).
+        // Only a new table: existing tables and queued operations
+        // are kept exactly as they are (no upgrade function).
+        this.version(7).stores({
+            syncQueue: "++id, operationId, status, localSeq, createdAt, ownerUserId",
+            meta: "key",
+            offlineSessions: "key",
+            cachedProducts: "id, tenantId, SKU, barcode, status",
+            cachedCustomers: "id, tenantId, customerId, name, phone, status",
+            cachedSuppliers: "id, tenantId, supplierId, supplierCode, name, phone, status",
+            cachedPurchases: "id, tenantId, purchaseId, operationId, purchaseNo, supplierId, syncStatus, status",
         });
     }
 }

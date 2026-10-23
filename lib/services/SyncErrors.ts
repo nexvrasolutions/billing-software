@@ -31,7 +31,8 @@ export type SyncErrorCode =
     | "IN_PROGRESS"
     | "NEEDS_ATTENTION"
     | "PERMANENT_FAILURE"
-    | "RETRYABLE_FAILURE";
+    | "RETRYABLE_FAILURE"
+    | "MAINTENANCE_PAUSED";
 
 /** A sync failure with the HTTP status and guidance the client needs. */
 export class SyncProcessError extends Error {
@@ -57,6 +58,41 @@ export class SyncProcessError extends Error {
                 : {}),
         };
     }
+}
+
+/** Dedicated error thrown when operations are paused for server-side maintenance. */
+export class MaintenancePausedError extends SyncProcessError {
+    public readonly isMaintenancePaused = true;
+
+    constructor(
+        message: string = "Purchase creation is temporarily paused for database maintenance. Please retry shortly.",
+        retryAfterSeconds: number = 30
+    ) {
+        super(503, "MAINTENANCE_PAUSED", message, true, retryAfterSeconds);
+        this.name = "MaintenancePausedError";
+    }
+}
+
+/** Type guard for checking if an error represents an operational maintenance pause. */
+export function isMaintenancePausedError(error: unknown): error is MaintenancePausedError {
+    if (error instanceof MaintenancePausedError) {
+        return true;
+    }
+    if (
+        error instanceof SyncProcessError &&
+        error.code === "MAINTENANCE_PAUSED"
+    ) {
+        return true;
+    }
+    if (
+        error &&
+        typeof error === "object" &&
+        ("isMaintenancePaused" in error ||
+            ("code" in error && (error as { code?: unknown }).code === "MAINTENANCE_PAUSED"))
+    ) {
+        return true;
+    }
+    return false;
 }
 
 // MongoDB server error codes that indicate a temporary condition.
@@ -118,6 +154,10 @@ export const SYNC_INTERNAL_ERROR_MESSAGE =
 
 /** Decide whether an error from processing is temporary or permanent. */
 export function classifySyncError(error: unknown): SyncFailureKind {
+    if (isMaintenancePausedError(error)) {
+        return "RETRYABLE";
+    }
+
     const mongo = mongoose.mongo;
 
     if (
@@ -209,8 +249,13 @@ export function publicStoredSyncMessage(message: string | undefined): string | u
 /** Status after a failed attempt (attempts already includes this attempt). */
 export function statusAfterFailure(
     kind: SyncFailureKind,
-    attempts: number
+    attempts: number,
+    isMaintenance?: boolean
 ): { status: "FAILED" | "NEEDS_ATTENTION"; failureKind: "RETRYABLE" | "PERMANENT" | "RETRIES_EXHAUSTED" } {
+    if (isMaintenance) {
+        return { status: "FAILED", failureKind: "RETRYABLE" };
+    }
+
     if (kind === "PERMANENT") {
         return { status: "NEEDS_ATTENTION", failureKind: "PERMANENT" };
     }

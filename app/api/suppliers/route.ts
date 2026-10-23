@@ -7,14 +7,11 @@ import { getAuthenticatedContext } from "@/lib/auth/getAuthenticatedContext";
 import { getGrantedPermissions } from "@/lib/auth/hasPermission";
 import { AuditLogService } from "@/lib/services/AuditLogService";
 import { SupplierCodeService } from "@/lib/services/SupplierCodeService";
-import { createSupplierSchema } from "@/lib/validations/supplier";
-
-const SUPPLIER_WRITE_PERMISSIONS = [
-    "purchases.create",
-    "products.create",
-    "products.update",
-    "users.read",
-];
+import {
+    createSupplierSchema,
+    SUPPLIER_WRITE_PERMISSIONS,
+    SUPPLIER_READ_PERMISSIONS,
+} from "@/lib/validations/supplier";
 
 export async function GET(request: NextRequest) {
     try {
@@ -23,6 +20,27 @@ export async function GET(request: NextRequest) {
             return NextResponse.json(
                 { success: false, message: "Authentication required" },
                 { status: 401 }
+            );
+        }
+
+        if (!auth.roleId) {
+            return NextResponse.json(
+                { success: false, message: "Permission denied" },
+                { status: 403 }
+            );
+        }
+
+        const granted = await getGrantedPermissions({
+            userId: auth.userId,
+            tenantId: auth.tenantId,
+            roleId: auth.roleId,
+            permissions: SUPPLIER_READ_PERMISSIONS,
+        });
+
+        if (granted.size === 0) {
+            return NextResponse.json(
+                { success: false, message: "You do not have permission to view suppliers" },
+                { status: 403 }
             );
         }
 
@@ -93,21 +111,26 @@ export async function POST(request: NextRequest) {
             );
         }
 
-        // Verify role authorization when roleId is present
-        if (auth.roleId) {
-            const granted = await getGrantedPermissions({
-                userId: auth.userId,
-                tenantId: auth.tenantId,
-                roleId: auth.roleId,
-                permissions: SUPPLIER_WRITE_PERMISSIONS,
-            });
+        // Verify role authorization (fail closed if role is missing)
+        if (!auth.roleId) {
+            return NextResponse.json(
+                { success: false, message: "Permission denied" },
+                { status: 403 }
+            );
+        }
 
-            if (granted.size === 0) {
-                return NextResponse.json(
-                    { success: false, message: "You do not have permission to create suppliers" },
-                    { status: 403 }
-                );
-            }
+        const granted = await getGrantedPermissions({
+            userId: auth.userId,
+            tenantId: auth.tenantId,
+            roleId: auth.roleId,
+            permissions: SUPPLIER_WRITE_PERMISSIONS,
+        });
+
+        if (granted.size === 0) {
+            return NextResponse.json(
+                { success: false, message: "You do not have permission to create suppliers" },
+                { status: 403 }
+            );
         }
 
         let body: unknown;

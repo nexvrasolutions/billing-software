@@ -12,6 +12,7 @@ import {
 } from "@/lib/auth/businessPermissions";
 
 import { uploadSchema, normalizeSupplierUpdatePayload } from "@/lib/validations/syncOperations";
+import { isPurchaseWritePaused, createMaintenancePausedResponse } from "@/lib/config/writePause";
 
 // Payloads are validated in detail when processed; here only shape and size.
 const MAX_PAYLOAD_BYTES = 100_000;
@@ -120,6 +121,13 @@ export async function POST(request: NextRequest) {
                     "You do not have permission to record this operation",
                     false
                 )
+            );
+        }
+
+        // Maintenance check: reject Purchase sync uploads when write-pause is active
+        if (input.entityType === "Purchase" && isPurchaseWritePaused()) {
+            return createMaintenancePausedResponse(
+                "Purchase sync upload is temporarily paused for database maintenance. Please retry shortly."
             );
         }
 

@@ -28,6 +28,23 @@ export function isValidSupplierId(id: unknown): boolean {
     return isValidMongoObjectId(id) || isTemporarySupplierId(id);
 }
 
+const TEMPORARY_PRODUCT_ID_REGEX = /^prod_[a-zA-Z0-9_-]+$/i;
+
+/**
+ * Validates whether a string is an offline temporary product ID (e.g. "prod_...").
+ */
+export function isTemporaryProductId(id: unknown): boolean {
+    return typeof id === "string" && TEMPORARY_PRODUCT_ID_REGEX.test(id.trim());
+}
+
+/**
+ * Validates whether a string is a valid product identifier for offline operations
+ * (server ObjectId or temporary offline ID starting with "prod_").
+ */
+export function isValidOfflineProductId(id: unknown): boolean {
+    return isValidMongoObjectId(id) || isTemporaryProductId(id);
+}
+
 /**
  * Optional string field helper:
  * - undefined, null, or empty/whitespace string -> undefined (omitted)
@@ -126,6 +143,39 @@ export const productSnapshotSchema = z
     })
     .passthrough();
 
+const basePurchaseItemShape = {
+    quantity: z
+        .number()
+        .finite("Quantity must be a finite number")
+        .gt(0, "Quantity must be greater than zero")
+        .max(1_000_000, "Quantity exceeds maximum allowable limit"),
+    unitPrice: z
+        .number()
+        .finite("Unit price must be a finite number")
+        .min(0, "Unit price cannot be negative")
+        .max(100_000_000, "Unit price exceeds maximum allowable limit"),
+    discountRate: z
+        .number()
+        .finite("Discount rate must be a finite number")
+        .min(0, "Discount rate cannot be negative")
+        .max(100, "Discount rate cannot exceed 100%")
+        .optional()
+        .default(0),
+    taxRate: z
+        .number()
+        .finite("Tax rate must be a finite number")
+        .min(0, "Tax rate cannot be negative")
+        .max(100, "Tax rate cannot exceed 100%")
+        .optional()
+        .default(0),
+    // Preserved for offline queueing and local display compatibility
+    productSnapshot: productSnapshotSchema.optional(),
+};
+
+/**
+ * Strict server-facing / online purchase item schema.
+ * Strictly requires a 24-character hexadecimal MongoDB ObjectId for productId.
+ */
 export const purchaseItemSchema = z
     .object({
         productId: z
@@ -135,36 +185,31 @@ export const purchaseItemSchema = z
                 (val) => isValidMongoObjectId(val),
                 "Invalid product ID (must be a 24-character hexadecimal ObjectId)"
             ),
-        quantity: z
-            .number()
-            .finite("Quantity must be a finite number")
-            .gt(0, "Quantity must be greater than zero")
-            .max(1_000_000, "Quantity exceeds maximum allowable limit"),
-        unitPrice: z
-            .number()
-            .finite("Unit price must be a finite number")
-            .min(0, "Unit price cannot be negative")
-            .max(100_000_000, "Unit price exceeds maximum allowable limit"),
-        discountRate: z
-            .number()
-            .finite("Discount rate must be a finite number")
-            .min(0, "Discount rate cannot be negative")
-            .max(100, "Discount rate cannot exceed 100%")
-            .optional()
-            .default(0),
-        taxRate: z
-            .number()
-            .finite("Tax rate must be a finite number")
-            .min(0, "Tax rate cannot be negative")
-            .max(100, "Tax rate cannot exceed 100%")
-            .optional()
-            .default(0),
-        // Preserved for offline queueing and local display compatibility
-        productSnapshot: productSnapshotSchema.optional(),
+        ...basePurchaseItemShape,
     })
     .strict();
 
 export type PurchaseItemValidationInput = z.infer<typeof purchaseItemSchema>;
+
+/**
+ * Dedicated offline purchase item schema.
+ * Permits either a valid 24-character hexadecimal MongoDB ObjectId or an
+ * explicitly supported temporary product ID starting with "prod_".
+ */
+export const offlinePurchaseItemSchema = z
+    .object({
+        productId: z
+            .string()
+            .trim()
+            .refine(
+                (val) => isValidOfflineProductId(val),
+                "Invalid product ID (must be a 24-character hexadecimal ObjectId or offline temporary ID starting with 'prod_')"
+            ),
+        ...basePurchaseItemShape,
+    })
+    .strict();
+
+export type OfflinePurchaseItemValidationInput = z.infer<typeof offlinePurchaseItemSchema>;
 
 export const supplierSnapshotSchema = z
     .object({
@@ -339,10 +384,10 @@ export type CreatePurchaseInput = z.infer<typeof createPurchaseSchema>;
 /**
  * Offline Sync Payload Schema:
  * Used for client-side queueing in Dexie db.syncQueue where a purchase may reference
- * a pending local temporary supplier ID ("sup_...").
+ * a pending local temporary supplier ID ("sup_...") and/or temporary product IDs ("prod_...").
  *
- * NOTE: The client's SyncManager resolves temporary supplier IDs to real server ObjectIds
- * via resolvePendingSupplierSync() before the purchase operation is uploaded to the server.
+ * NOTE: The client's SyncManager resolves temporary supplier and product IDs to real server ObjectIds
+ * before the purchase operation is uploaded to the server.
  * The server-facing API (POST /api/purchases) strictly uses createPurchaseSchema.
  */
 export const offlinePurchasePayloadSchema = z
@@ -355,6 +400,10 @@ export const offlinePurchasePayloadSchema = z
                 (val) => isValidSupplierId(val),
                 "Invalid supplier ID (must be a 24-character hexadecimal ObjectId or offline temporary ID starting with 'sup_')"
             ),
+        items: z
+            .array(offlinePurchaseItemSchema)
+            .min(1, "At least one purchase item is required")
+            .max(500, "Cannot exceed 500 items per purchase order"),
     })
     .strict()
     .refine(

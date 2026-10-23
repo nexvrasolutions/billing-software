@@ -45,6 +45,27 @@ export default function ReportsPage() {
         loadReportData();
     }, []);
 
+    const [canViewAudit, setCanViewAudit] = useState(false);
+
+    useEffect(() => {
+        async function checkAuditAccess() {
+            try {
+                const res = await fetch("/api/auth/me");
+                if (res.ok) {
+                    const data = await res.json();
+                    const isOwner = Boolean(data.user?.isOwner);
+                    const permissions: string[] = data.permissions || [];
+                    if (isOwner || permissions.includes("auditLogs.read")) {
+                        setCanViewAudit(true);
+                    }
+                }
+            } catch {
+                // Ignore error
+            }
+        }
+        checkAuditAccess();
+    }, []);
+
     // Filter sales by date range
     const filteredSales = sales.filter((s) => {
         const d = s.saleDate ? new Date(s.saleDate).toISOString().slice(0, 10) : "";
@@ -59,9 +80,11 @@ export default function ReportsPage() {
             <main className="flex max-w-5xl flex-col gap-4">
                 <div className="flex flex-wrap items-center justify-between gap-2">
                     <h1 className="text-2xl font-semibold tracking-tight">Reports</h1>
-                    <Link href="/reports/audit" className="text-sm underline">
-                        Audit log
-                    </Link>
+                    {canViewAudit && (
+                        <Link href="/reports/audit" className="text-sm underline">
+                            Audit log
+                        </Link>
+                    )}
                 </div>
 
                 {/* View switcher nav */}

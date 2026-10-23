@@ -13,6 +13,7 @@ import { getGrantedPermissions } from "./hasPermission";
 export const BUSINESS_PERMISSIONS = {
     productsCreate: "products.create",
     salesCreate: "sales.create",
+    salesRead: "sales.read",
     // Selling at a price other than the product's selling price, or with a discount.
     salesPriceOverride: "sales.priceOverride",
     // Dating a sale earlier than the allowed window (see SALE_DATE_RULES).

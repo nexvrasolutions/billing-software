@@ -8,6 +8,15 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { formatPaise, rupeesToPaise } from "@/lib/money";
 import { formatQuantity } from "@/lib/quantity";
+import { restoreOfflineSession, readRememberedIdentity } from "@/lib/offline/offlineAccess";
+import {
+    getCachedPurchaseById,
+    isTemporaryPurchaseId,
+    isValidServerPurchaseId,
+    saveCachedPurchases,
+} from "@/lib/offline/purchaseCache";
+import { isTemporarySupplierCode } from "@/lib/offline/supplierCache";
+import { SESSION_CHECK_TIMEOUT_MS } from "@/lib/offline/sessionIdentity";
 
 interface PaymentItem {
     _id?: string;
@@ -26,8 +35,10 @@ interface PurchaseItem {
     supplierId?: string;
     supplierInvoiceNo?: string;
     supplierSnapshot?: {
-        name: string;
+        name?: string;
         supplierCode?: string;
+        phone?: string;
+        gstin?: string;
     };
     purchaseDate: string;
     subtotal?: number;
@@ -39,11 +50,13 @@ interface PurchaseItem {
     dueAmount: number;
     paymentStatus: string;
     status: string;
+    syncStatus?: "PENDING" | "SYNCING" | "SYNCED" | "FAILED" | "NEEDS_ATTENTION";
+    errorMessage?: string;
     notes?: string;
     items?: Array<{
         productId: string;
         productSnapshot?: {
-            name: string;
+            name?: string;
             SKU?: string;
             unit?: string;
         };
@@ -54,7 +67,8 @@ interface PurchaseItem {
             rate: number;
             amount: number;
         };
-        total: number;
+        taxRate?: number;
+        total?: number;
     }>;
 }
 
@@ -77,6 +91,7 @@ export default function PurchaseDetailPage({ params }: { params: Promise<{ id: s
     const [payments, setPayments] = useState<PaymentItem[]>([]);
     const [loading, setLoading] = useState(true);
     const [error, setError] = useState<string | null>(null);
+    const [isOfflineView, setIsOfflineView] = useState(false);
     const [paymentModal, setPaymentModal] = useState<PaymentModalState | null>(null);
 
     const [refreshKey, setRefreshKey] = useState(0);
@@ -85,24 +100,149 @@ export default function PurchaseDetailPage({ params }: { params: Promise<{ id: s
         let isCancelled = false;
 
         async function fetchPurchase() {
+            setLoading(true);
+            setError(null);
+
+            const isTemp = isTemporaryPurchaseId(id);
+            const isValidServer = isValidServerPurchaseId(id);
+
+            // 1. If it's a server ObjectId and navigator is online, try fetching from server
+            if (isValidServer && typeof navigator !== "undefined" && navigator.onLine) {
+                try {
+                    const timeoutController = new AbortController();
+                    const timeoutId = setTimeout(() => timeoutController.abort(), SESSION_CHECK_TIMEOUT_MS);
+
+                    const res = await fetch(`/api/purchases/${id}`, {
+                        signal: timeoutController.signal,
+                        credentials: "same-origin",
+                    });
+                    clearTimeout(timeoutId);
+
+                    const data = await res.json().catch(() => null);
+
+                    if (isCancelled) return;
+
+                    if (res.ok && data?.success && data.purchase) {
+                        const serverP = data.purchase;
+                        const mapped: PurchaseItem = {
+                            _id: String(serverP._id || serverP.id),
+                            purchaseNo: serverP.purchaseNo,
+                            supplierId: serverP.supplierId,
+                            supplierInvoiceNo: serverP.supplierInvoiceNo,
+                            supplierSnapshot: serverP.supplierSnapshot,
+                            purchaseDate: serverP.purchaseDate,
+                            subtotal: serverP.subtotal,
+                            discountTotal: serverP.discountTotal,
+                            taxTotal: serverP.taxTotal,
+                            shippingCost: serverP.shippingCost,
+                            grandTotal: serverP.grandTotal,
+                            paidAmount: serverP.paidAmount,
+                            dueAmount: serverP.dueAmount,
+                            paymentStatus: serverP.paymentStatus,
+                            status: serverP.status || "received",
+                            syncStatus: "SYNCED",
+                            notes: serverP.notes,
+                            items: serverP.items,
+                        };
+
+                        setPurchase(mapped);
+                        setPayments(data.payments || []);
+                        setIsOfflineView(false);
+
+                        // Cache in IndexedDB if tenantId is available
+                        let tenantId = serverP.tenantId ? String(serverP.tenantId) : null;
+                        if (!tenantId) {
+                            const remembered = await readRememberedIdentity().catch(() => null);
+                            tenantId = remembered?.tenantId || null;
+                        }
+                        if (tenantId) {
+                            await saveCachedPurchases([serverP], tenantId).catch(() => undefined);
+                        }
+
+                        setLoading(false);
+                        return;
+                    }
+                } catch {
+                    // Server fetch failed / timed out; fall through to local cache
+                }
+            }
+
+            if (isCancelled) return;
+
+            // 2. Offline Fallback: load purchase from cachedPurchases
             try {
-                const res = await fetch(`/api/purchases/${id}`);
-                const data = await res.json();
-                if (isCancelled) return;
-                if (data.success && data.purchase) {
-                    setPurchase(data.purchase);
-                    setPayments(data.payments || []);
-                } else {
-                    setError(data.message || "Failed to load purchase");
+                let tenantId: string | null = null;
+                const restored = await restoreOfflineSession().catch(() => null);
+                if (restored?.ok && restored.identity?.tenantId) {
+                    tenantId = restored.identity.tenantId;
                 }
-            } catch (err: unknown) {
-                if (isCancelled) return;
-                const msg = err instanceof Error ? err.message : "Failed to load purchase";
-                setError(msg);
-            } finally {
-                if (!isCancelled) {
+                if (!tenantId) {
+                    const remembered = await readRememberedIdentity().catch(() => null);
+                    tenantId = remembered?.tenantId || null;
+                }
+
+                if (!tenantId) {
+                    setError("Unable to identify authorized business session to load purchase.");
                     setLoading(false);
+                    return;
                 }
+
+                const cached = await getCachedPurchaseById(id, tenantId);
+
+                if (isCancelled) return;
+
+                if (!cached) {
+                    setError(isTemp ? "Offline provisional purchase not found." : "Purchase bill not found.");
+                    setLoading(false);
+                    return;
+                }
+
+                const mapped: PurchaseItem = {
+                    _id: cached.purchaseId,
+                    purchaseNo: cached.purchaseNo,
+                    supplierId: cached.supplierId,
+                    supplierInvoiceNo: cached.supplierInvoiceNo,
+                    supplierSnapshot: cached.supplierSnapshot,
+                    purchaseDate: cached.purchaseDate,
+                    subtotal: cached.subtotal,
+                    discountTotal: cached.discountTotal,
+                    taxTotal: cached.taxTotal,
+                    shippingCost: cached.shippingCost,
+                    grandTotal: cached.grandTotal,
+                    paidAmount: cached.paidAmount,
+                    dueAmount: cached.dueAmount ?? Math.max(0, cached.grandTotal - cached.paidAmount),
+                    paymentStatus: cached.paymentStatus || "unpaid",
+                    status: cached.status,
+                    syncStatus: cached.syncStatus,
+                    errorMessage: cached.errorMessage,
+                    notes: cached.notes,
+                    items: (cached.items || []).map((item) => {
+                        const taxRate = item.taxRate ?? 0;
+                        const gross = item.quantity * item.unitPrice;
+                        const disc = (gross * (item.discountRate ?? 0)) / 100;
+                        const taxable = gross - disc;
+                        const taxAmt = (taxable * taxRate) / 100;
+                        return {
+                            productId: item.productId,
+                            productSnapshot: item.productSnapshot,
+                            quantity: item.quantity,
+                            unitPrice: item.unitPrice,
+                            discountRate: item.discountRate,
+                            taxRate,
+                            tax: { rate: taxRate, amount: taxAmt },
+                            total: taxable + taxAmt,
+                        };
+                    }),
+                };
+
+                setPurchase(mapped);
+                setPayments([]);
+                setIsOfflineView(true);
+                setLoading(false);
+            } catch (err: any) {
+                if (isCancelled) return;
+                setError(err?.message || "Failed to load purchase");
+                setLoading(false);
             }
         }
 
@@ -167,7 +307,6 @@ export default function PurchaseDetailPage({ params }: { params: Promise<{ id: s
             return;
         }
 
-        // Set submitting state while keeping operationId and paymentNo stable!
         setPaymentModal((prev) => (prev ? { ...prev, isSubmitting: true, submitError: null } : null));
 
         try {
@@ -218,8 +357,13 @@ export default function PurchaseDetailPage({ params }: { params: Promise<{ id: s
         }
     }
 
+    const isTemporary = isTemporaryPurchaseId(purchase?._id);
+    const isUnsynced = purchase?.syncStatus !== "SYNCED";
+
     const canRecordPayment = Boolean(
         purchase &&
+        !isTemporary &&
+        !isUnsynced &&
         (purchase.dueAmount ?? 0) > 0 &&
         purchase.status === "received"
     );
@@ -234,9 +378,23 @@ export default function PurchaseDetailPage({ params }: { params: Promise<{ id: s
                 {loading ? (
                     <p className="text-sm text-muted-foreground">Loading purchase bill...</p>
                 ) : !purchase ? (
-                    <p className="text-sm text-destructive">{error || "Purchase not found."}</p>
+                    <div className="rounded-lg border border-destructive/20 bg-destructive/10 p-4 text-sm text-destructive">
+                        {error || "Purchase not found."}
+                    </div>
                 ) : (
                     <>
+                        {isTemporary && (
+                            <div className="rounded-lg border border-amber-200 bg-amber-50 p-3 text-sm text-amber-900 dark:border-amber-900/50 dark:bg-amber-950/30 dark:text-amber-200">
+                                <strong>Provisional offline bill:</strong> This purchase was recorded offline ({purchase._id}). It will be synchronized with the server when online connection is active.
+                            </div>
+                        )}
+
+                        {purchase.syncStatus === "NEEDS_ATTENTION" && (
+                            <div className="rounded-lg border border-red-200 bg-red-50 p-3 text-sm text-red-900 dark:border-red-900/50 dark:bg-red-950/30 dark:text-red-200">
+                                <strong>Synchronization conflict:</strong> {purchase.errorMessage || "This purchase requires attention before it can be applied to the server."}
+                            </div>
+                        )}
+
                         <div className="flex flex-wrap items-center justify-between gap-3">
                             <div>
                                 <h1 className="text-2xl font-semibold tracking-tight">
@@ -247,8 +405,16 @@ export default function PurchaseDetailPage({ params }: { params: Promise<{ id: s
                                 </h1>
 
                                 <p className="text-sm mt-0.5">
-                                    <span className="font-medium">{purchase.supplierSnapshot?.name || "Supplier"}</span> · bill date{" "}
-                                    {purchase.purchaseDate ? new Date(purchase.purchaseDate).toISOString().slice(0, 10) : "—"}
+                                    <span className="font-medium">{purchase.supplierSnapshot?.name || "Supplier"}</span>
+                                    {isTemporarySupplierCode(purchase.supplierSnapshot?.supplierCode) && (
+                                        <span className="ml-1 text-xs text-amber-600 dark:text-amber-400">
+                                            (Pending supplier)
+                                        </span>
+                                    )}
+                                    {" · bill date "}
+                                    {purchase.purchaseDate
+                                        ? new Date(purchase.purchaseDate).toISOString().slice(0, 10)
+                                        : "—"}
                                     {purchase.notes ? ` · ${purchase.notes}` : ""}
                                 </p>
                             </div>
@@ -262,6 +428,12 @@ export default function PurchaseDetailPage({ params }: { params: Promise<{ id: s
                                 >
                                     Record Payment
                                 </Button>
+                            )}
+
+                            {isUnsynced && (
+                                <span className="text-xs text-muted-foreground italic">
+                                    (Payments can be recorded once synchronized online)
+                                </span>
                             )}
                         </div>
 
@@ -294,10 +466,14 @@ export default function PurchaseDetailPage({ params }: { params: Promise<{ id: s
                                                 {formatPaise(rupeesToPaise(item.unitPrice))}
                                             </td>
                                             <td className="p-2 text-right tabular-nums">
-                                                {item.tax?.rate ? `${item.tax.rate}%` : "0%"}
+                                                {item.taxRate !== undefined
+                                                    ? `${item.taxRate}%`
+                                                    : item.tax?.rate !== undefined
+                                                    ? `${item.tax.rate}%`
+                                                    : "0%"}
                                             </td>
                                             <td className="p-2 text-right tabular-nums font-medium">
-                                                {formatPaise(rupeesToPaise(item.total))}
+                                                {formatPaise(rupeesToPaise(item.total ?? (item.quantity * item.unitPrice)))}
                                             </td>
                                         </tr>
                                     ))}
@@ -305,249 +481,203 @@ export default function PurchaseDetailPage({ params }: { params: Promise<{ id: s
                             </table>
                         </div>
 
-                        <dl className="totals max-w-sm rounded-lg border text-sm self-end" aria-label="Bill totals">
-                            <div className="flex justify-between p-2">
-                                <dt className="text-muted-foreground">Subtotal</dt>
-                                <dd className="tabular-nums font-medium">{formatPaise(rupeesToPaise(purchase.subtotal || 0))}</dd>
-                            </div>
-                            <div className="flex justify-between p-2 border-t">
-                                <dt className="text-muted-foreground">Tax Total</dt>
-                                <dd className="tabular-nums font-medium">{formatPaise(rupeesToPaise(purchase.taxTotal || 0))}</dd>
-                            </div>
-                            <div className="flex justify-between p-2 border-t bg-muted/20">
-                                <dt className="font-semibold">Grand Total</dt>
-                                <dd className="tabular-nums font-semibold text-base">{formatPaise(rupeesToPaise(purchase.grandTotal || 0))}</dd>
-                            </div>
-                            <div className="flex justify-between p-2 border-t">
-                                <dt className="text-muted-foreground">Total paid</dt>
-                                <dd className="tabular-nums">{formatPaise(rupeesToPaise(purchase.paidAmount || 0))}</dd>
-                            </div>
-                            <div className="flex justify-between p-2 border-t">
-                                <dt className="text-muted-foreground">Due Amount</dt>
-                                <dd className={`tabular-nums font-medium ${purchase.dueAmount > 0 ? "text-amber-600 dark:text-amber-400" : "text-emerald-600 dark:text-emerald-400"}`}>
-                                    {formatPaise(rupeesToPaise(purchase.dueAmount || 0))}
-                                    {purchase.dueAmount === 0 ? " (Settled)" : ""}
-                                </dd>
-                            </div>
-                        </dl>
-
-                        {/* Payment history */}
-                        <section className="flex flex-col gap-3 mt-4 border-t pt-4" aria-label="Payment history">
-                            <div className="flex items-center justify-between">
-                                <h2 className="text-base font-semibold">Payment history</h2>
-                                <span className="text-xs text-muted-foreground">
-                                    {payments.length} record{payments.length === 1 ? "" : "s"}
-                                </span>
-                            </div>
-
-                            {payments.length === 0 ? (
-                                <div className="rounded-lg border border-dashed p-4 text-center text-xs text-muted-foreground">
-                                    No payment transactions recorded for this bill yet.
-                                    {purchase.paidAmount > 0 ? " (Initial amount was paid directly with the bill.)" : ""}
+                        {/* Bill Totals Summary */}
+                        <div className="flex flex-col items-end gap-1.5 border-t pt-3 text-sm">
+                            {purchase.subtotal !== undefined && (
+                                <div className="flex justify-between w-64">
+                                    <span className="text-muted-foreground">Subtotal (before tax):</span>
+                                    <span className="tabular-nums">{formatPaise(rupeesToPaise(purchase.subtotal))}</span>
                                 </div>
-                            ) : (
+                            )}
+                            {purchase.taxTotal !== undefined && (
+                                <div className="flex justify-between w-64">
+                                    <span className="text-muted-foreground">GST:</span>
+                                    <span className="tabular-nums">{formatPaise(rupeesToPaise(purchase.taxTotal))}</span>
+                                </div>
+                            )}
+                            {purchase.shippingCost !== undefined && purchase.shippingCost > 0 && (
+                                <div className="flex justify-between w-64">
+                                    <span className="text-muted-foreground">Shipping:</span>
+                                    <span className="tabular-nums">{formatPaise(rupeesToPaise(purchase.shippingCost))}</span>
+                                </div>
+                            )}
+                            <div className="flex justify-between w-64 font-semibold text-base border-t pt-1">
+                                <span>Grand Total:</span>
+                                <span className="tabular-nums">{formatPaise(rupeesToPaise(purchase.grandTotal))}</span>
+                            </div>
+                            <div className="flex justify-between w-64 text-muted-foreground">
+                                <span>Paid with bill:</span>
+                                <span className="tabular-nums">{formatPaise(rupeesToPaise(purchase.paidAmount))}</span>
+                            </div>
+                            <div className="flex justify-between w-64 font-medium text-amber-700 dark:text-amber-400">
+                                <span>Balance due:</span>
+                                <span className="tabular-nums">{formatPaise(rupeesToPaise(purchase.dueAmount))}</span>
+                            </div>
+                        </div>
+
+                        {/* Payments Section */}
+                        {payments.length > 0 && (
+                            <section className="flex flex-col gap-2 pt-4">
+                                <h2 className="text-lg font-semibold tracking-tight">Payments Recorded</h2>
                                 <div className="table-scroll">
-                                    <table className="w-full text-sm" aria-label="Purchase payments">
+                                    <table className="w-full text-sm" aria-label="Payments">
                                         <thead className="border-b bg-muted/40 text-left">
                                             <tr>
-                                                <th className="p-2.5 font-medium">Date</th>
-                                                <th className="p-2.5 font-medium">Payment #</th>
-                                                <th className="p-2.5 font-medium">Method</th>
-                                                <th className="p-2.5 font-medium">Reference</th>
-                                                <th className="p-2.5 font-medium">Notes</th>
-                                                <th className="p-2.5 text-right font-medium">Amount</th>
-                                                <th className="p-2.5 text-right font-medium">Status</th>
+                                                <th className="p-2 font-medium">Receipt #</th>
+                                                <th className="p-2 font-medium">Date</th>
+                                                <th className="p-2 font-medium">Method</th>
+                                                <th className="p-2 text-right font-medium">Amount</th>
+                                                <th className="p-2 font-medium">Ref #</th>
                                             </tr>
                                         </thead>
                                         <tbody className="divide-y">
-                                            {payments.map((p) => {
-                                                const dateStr = p.paymentDate
-                                                    ? new Date(p.paymentDate).toLocaleDateString("en-IN", {
-                                                          dateStyle: "medium",
-                                                      })
-                                                    : "—";
-                                                return (
-                                                    <tr key={p._id || p.paymentNo} className="hover:bg-muted/30">
-                                                        <td className="p-2.5 text-muted-foreground tabular-nums">{dateStr}</td>
-                                                        <td className="p-2.5 font-mono text-xs font-medium">{p.paymentNo}</td>
-                                                        <td className="p-2.5 capitalize">{p.paymentMethod || "—"}</td>
-                                                        <td className="p-2.5 text-muted-foreground">{p.referenceNo || "—"}</td>
-                                                        <td className="p-2.5 text-muted-foreground max-w-[180px] truncate" title={p.notes}>
-                                                            {p.notes || "—"}
-                                                        </td>
-                                                        <td className="p-2.5 text-right tabular-nums font-medium text-emerald-600 dark:text-emerald-400">
-                                                            {formatPaise(rupeesToPaise(p.amount || 0))}
-                                                        </td>
-                                                        <td className="p-2.5 text-right">
-                                                            <span className="inline-block rounded-full bg-emerald-500/10 px-2 py-0.5 text-[11px] font-medium text-emerald-700 dark:text-emerald-300 capitalize">
-                                                                {p.status || "completed"}
-                                                            </span>
-                                                        </td>
-                                                    </tr>
-                                                );
-                                            })}
+                                            {payments.map((p) => (
+                                                <tr key={p._id || p.paymentNo}>
+                                                    <td className="p-2 font-mono text-xs">{p.paymentNo}</td>
+                                                    <td className="p-2">
+                                                        {p.paymentDate ? new Date(p.paymentDate).toISOString().slice(0, 10) : "—"}
+                                                    </td>
+                                                    <td className="p-2 capitalize">{p.paymentMethod}</td>
+                                                    <td className="p-2 text-right tabular-nums">
+                                                        {formatPaise(rupeesToPaise(p.amount))}
+                                                    </td>
+                                                    <td className="p-2">{p.referenceNo || "—"}</td>
+                                                </tr>
+                                            ))}
                                         </tbody>
                                     </table>
                                 </div>
-                            )}
-                        </section>
+                            </section>
+                        )}
                     </>
                 )}
-            </main>
 
-            {/* Record Payment Modal */}
-            {paymentModal && purchase && (
-                <div
-                    role="dialog"
-                    aria-modal="true"
-                    aria-labelledby="pay-modal-title"
-                    aria-describedby="pay-modal-desc"
-                    className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4 animate-in fade-in"
-                    onKeyDown={(e) => {
-                        if (e.key === "Escape" && !paymentModal.isSubmitting) {
-                            handleClosePaymentModal();
-                        }
-                    }}
-                >
-                    <div className="relative w-full max-w-md rounded-xl border bg-background p-6 shadow-2xl">
-                        <h2 id="pay-modal-title" className="text-lg font-semibold tracking-tight">
-                            Record Supplier Payment
-                        </h2>
-                        <p id="pay-modal-desc" className="mt-1 text-sm text-muted-foreground">
-                            Bill <span className="font-medium text-foreground">{purchase.supplierInvoiceNo || purchase.purchaseNo}</span>
-                            {" · "}
-                            Due: <span className="font-semibold text-amber-600 dark:text-amber-400">{formatPaise(rupeesToPaise(purchase.dueAmount || 0))}</span>
-                        </p>
+                {/* Record Payment Modal */}
+                {paymentModal?.isOpen && (
+                    <div
+                        className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4"
+                        role="dialog"
+                        aria-modal="true"
+                        aria-labelledby="pay-modal-title"
+                    >
+                        <div className="w-full max-w-md rounded-lg border bg-background p-6 shadow-lg">
+                            <h2 id="pay-modal-title" className="text-lg font-semibold">
+                                Record Bill Payment
+                            </h2>
+                            <p className="text-sm text-muted-foreground mt-1">
+                                Pay against bill {purchase?.supplierInvoiceNo || purchase?.purchaseNo}. Max due: ₹{purchase?.dueAmount}.
+                            </p>
 
-                        <form onSubmit={handlePaymentSubmit} className="mt-4 flex flex-col gap-3">
-                            <div className="flex flex-col gap-1.5">
-                                <Label htmlFor="pay-amount">
-                                    Amount (₹) <span className="text-destructive">*</span>
-                                </Label>
-                                <Input
-                                    id="pay-amount"
-                                    type="number"
-                                    step="0.01"
-                                    min="0.01"
-                                    max={purchase.dueAmount}
-                                    required
-                                    disabled={paymentModal.isSubmitting}
-                                    value={paymentModal.amount}
-                                    onChange={(e) =>
-                                        setPaymentModal((prev) => (prev ? { ...prev, amount: e.target.value } : null))
-                                    }
-                                />
-                                <span className="text-[11px] text-muted-foreground">
-                                    Max payable: {formatPaise(rupeesToPaise(purchase.dueAmount || 0))}
-                                </span>
-                            </div>
+                            <form onSubmit={handlePaymentSubmit} className="mt-4 flex flex-col gap-3">
+                                {paymentModal.submitError && (
+                                    <div className="rounded-lg border border-destructive/20 bg-destructive/10 p-2.5 text-xs text-destructive">
+                                        {paymentModal.submitError}
+                                    </div>
+                                )}
 
-                            <div className="flex flex-col gap-1.5">
-                                <Label htmlFor="pay-method">
-                                    Payment method <span className="text-destructive">*</span>
-                                </Label>
-                                <select
-                                    id="pay-method"
-                                    className="h-9 rounded-md border border-input bg-transparent px-3 text-sm focus:outline-none focus:ring-2 focus:ring-ring"
-                                    value={paymentModal.paymentMethod}
-                                    disabled={paymentModal.isSubmitting}
-                                    onChange={(e) =>
-                                        setPaymentModal((prev) =>
-                                            prev
-                                                ? {
-                                                      ...prev,
-                                                      paymentMethod: e.target.value as PaymentModalState["paymentMethod"],
-                                                  }
-                                                : null
-                                        )
-                                    }
-                                >
-                                    <option value="cash">Cash</option>
-                                    <option value="upi">UPI</option>
-                                    <option value="bank">Bank transfer</option>
-                                    <option value="card">Card</option>
-                                    <option value="other">Other</option>
-                                </select>
-                            </div>
-
-                            <div className="flex flex-col gap-1.5">
-                                <Label htmlFor="pay-date">
-                                    Payment date <span className="text-destructive">*</span>
-                                </Label>
-                                <Input
-                                    id="pay-date"
-                                    type="date"
-                                    required
-                                    disabled={paymentModal.isSubmitting}
-                                    value={paymentModal.paymentDate}
-                                    onChange={(e) =>
-                                        setPaymentModal((prev) => (prev ? { ...prev, paymentDate: e.target.value } : null))
-                                    }
-                                />
-                            </div>
-
-                            <div className="flex flex-col gap-1.5">
-                                <Label htmlFor="pay-ref">
-                                    Reference # / Transaction ID <span className="text-xs text-muted-foreground font-normal">(optional)</span>
-                                </Label>
-                                <Input
-                                    id="pay-ref"
-                                    placeholder="e.g. UTR / Cheque / Transaction ref"
-                                    maxLength={100}
-                                    disabled={paymentModal.isSubmitting}
-                                    value={paymentModal.referenceNo}
-                                    onChange={(e) =>
-                                        setPaymentModal((prev) => (prev ? { ...prev, referenceNo: e.target.value } : null))
-                                    }
-                                />
-                            </div>
-
-                            <div className="flex flex-col gap-1.5">
-                                <Label htmlFor="pay-notes">
-                                    Notes <span className="text-xs text-muted-foreground font-normal">(optional)</span>
-                                </Label>
-                                <Input
-                                    id="pay-notes"
-                                    placeholder="Optional remarks"
-                                    maxLength={200}
-                                    disabled={paymentModal.isSubmitting}
-                                    value={paymentModal.notes}
-                                    onChange={(e) =>
-                                        setPaymentModal((prev) => (prev ? { ...prev, notes: e.target.value } : null))
-                                    }
-                                />
-                            </div>
-
-                            {paymentModal.submitError && (
-                                <div
-                                    role="alert"
-                                    className="rounded-md bg-destructive/10 p-3 text-xs font-medium text-destructive"
-                                >
-                                    {paymentModal.submitError}
+                                <div className="flex flex-col gap-1">
+                                    <Label htmlFor="pay-amt">Amount (₹)</Label>
+                                    <Input
+                                        id="pay-amt"
+                                        type="number"
+                                        step="0.01"
+                                        value={paymentModal.amount}
+                                        onChange={(e) =>
+                                            setPaymentModal((prev) =>
+                                                prev ? { ...prev, amount: e.target.value, submitError: null } : null
+                                            )
+                                        }
+                                        required
+                                        autoFocus
+                                    />
                                 </div>
-                            )}
 
-                            <div className="mt-2 flex items-center justify-end gap-2">
-                                <Button
-                                    type="button"
-                                    variant="outline"
-                                    disabled={paymentModal.isSubmitting}
-                                    onClick={handleClosePaymentModal}
-                                >
-                                    Cancel
-                                </Button>
-                                <Button
-                                    type="submit"
-                                    disabled={paymentModal.isSubmitting}
-                                >
-                                    {paymentModal.isSubmitting ? "Recording..." : "Record Payment"}
-                                </Button>
-                            </div>
-                        </form>
+                                <div className="flex flex-col gap-1">
+                                    <Label htmlFor="pay-method">Payment Method</Label>
+                                    <select
+                                        id="pay-method"
+                                        value={paymentModal.paymentMethod}
+                                        onChange={(e) =>
+                                            setPaymentModal((prev) =>
+                                                prev
+                                                    ? {
+                                                          ...prev,
+                                                          paymentMethod: e.target.value as any,
+                                                      }
+                                                    : null
+                                            )
+                                        }
+                                        className="h-9 rounded-md border border-input bg-transparent px-3 text-sm"
+                                    >
+                                        <option value="cash">Cash</option>
+                                        <option value="bank">Bank Transfer / NEFT</option>
+                                        <option value="upi">UPI</option>
+                                        <option value="card">Card</option>
+                                        <option value="other">Other</option>
+                                    </select>
+                                </div>
+
+                                <div className="flex flex-col gap-1">
+                                    <Label htmlFor="pay-date">Payment Date</Label>
+                                    <Input
+                                        id="pay-date"
+                                        type="date"
+                                        value={paymentModal.paymentDate}
+                                        onChange={(e) =>
+                                            setPaymentModal((prev) =>
+                                                prev ? { ...prev, paymentDate: e.target.value } : null
+                                            )
+                                        }
+                                        required
+                                    />
+                                </div>
+
+                                <div className="flex flex-col gap-1">
+                                    <Label htmlFor="pay-ref">Reference No. (optional)</Label>
+                                    <Input
+                                        id="pay-ref"
+                                        placeholder="e.g. UTR / Transaction ID"
+                                        value={paymentModal.referenceNo}
+                                        onChange={(e) =>
+                                            setPaymentModal((prev) =>
+                                                prev ? { ...prev, referenceNo: e.target.value } : null
+                                            )
+                                        }
+                                    />
+                                </div>
+
+                                <div className="flex flex-col gap-1">
+                                    <Label htmlFor="pay-notes">Notes (optional)</Label>
+                                    <Input
+                                        id="pay-notes"
+                                        placeholder="Optional payment notes"
+                                        value={paymentModal.notes}
+                                        onChange={(e) =>
+                                            setPaymentModal((prev) =>
+                                                prev ? { ...prev, notes: e.target.value } : null
+                                            )
+                                        }
+                                    />
+                                </div>
+
+                                <div className="mt-2 flex justify-end gap-2">
+                                    <Button
+                                        type="button"
+                                        variant="outline"
+                                        onClick={handleClosePaymentModal}
+                                        disabled={paymentModal.isSubmitting}
+                                    >
+                                        Cancel
+                                    </Button>
+                                    <Button type="submit" disabled={paymentModal.isSubmitting}>
+                                        {paymentModal.isSubmitting ? "Recording..." : "Confirm Payment"}
+                                    </Button>
+                                </div>
+                            </form>
+                        </div>
                     </div>
-                </div>
-            )}
+                )}
+            </main>
         </AppShell>
     );
 }
-
